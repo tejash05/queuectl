@@ -12,7 +12,7 @@ A miniature of Sidekiq / BullMQ / Celery / SQS workers — durable SQLite storag
 - SQLite persistence (WAL mode)
 - Exponential backoff retries
 - Dead letter queue + operator retry
-- Lease-based crash recovery (&lt; 60s worst case)
+- Lease-based crash recovery (< 60s worst case)
 - Worker heartbeats + lease extension
 - Graceful SIGINT/SIGTERM shutdown
 - Cooperative `worker stop`
@@ -120,7 +120,7 @@ Backoff: `backoff_base_ms * 2^(attempts - 1)`.
 4. Another worker (or the next poll) recovers rows where `status=running AND lease_until < now`
 5. Job returns to `pending` for re-execution
 
-Defaults: `lease_timeout_ms=30000`, poll every `1000ms` → worst-case recovery &lt; 60s.
+Defaults: `lease_timeout_ms=30000`, poll every `1000ms` → worst-case recovery < 60s.
 
 ## CLI Reference
 
