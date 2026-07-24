@@ -8,9 +8,17 @@ A miniature of Sidekiq / BullMQ / Celery / SQS workers — durable SQLite storag
 
 ```bash
 npm install
-npm link          # exposes `queuectl` on your PATH
-# or without link:
+npm run build
+npm link          # exposes `queuectl` on your PATH via dist/index.js
+queuectl --help
+```
+
+Local development without linking:
+
+```bash
 npm run queuectl -- --help
+# or
+npx tsx src/index.ts --help
 ```
 
 Database path defaults to `./data/queuectl.sqlite`. Override with `QUEUECTL_DB`.
@@ -149,7 +157,6 @@ src/
   types/         # shared unions
 tests/
 docs/
-bin/queuectl
 README.md
 DECISIONS.md
 ```
