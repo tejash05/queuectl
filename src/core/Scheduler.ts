@@ -41,14 +41,13 @@ export class Scheduler {
 
   async run(): Promise<void> {
     const { workerId, workerService, config } = this.deps;
-    const heartbeatInterval = config.get("heartbeat_interval_ms");
-    const pollInterval = config.get("poll_interval_ms");
+    const heartbeatInterval = config.get("heartbeat-interval-ms");
+    const pollInterval = config.get("poll-interval-ms");
 
     this.heartbeatTimer = setInterval(() => {
       this.tickHeartbeat();
     }, heartbeatInterval);
 
-    // Ensure timer does not keep process alive unintentionally during tests
     this.heartbeatTimer.unref?.();
 
     try {
@@ -61,7 +60,7 @@ export class Scheduler {
         this.deps.recovery.recoverExpiredLeases();
         this.tickHeartbeat();
 
-        const leaseTimeout = config.get("lease_timeout_ms");
+        const leaseTimeout = config.get("lease-timeout-ms");
         const now = nowIso();
         const job = this.deps.jobs.claimNext({
           workerId,
@@ -78,7 +77,7 @@ export class Scheduler {
           job_id: job.id,
           worker_id: workerId,
           attempt: job.attempts,
-          command: job.command.join(" "),
+          command: job.command,
         });
 
         this.currentJobId = job.id;
@@ -99,14 +98,14 @@ export class Scheduler {
     workerService.heartbeat(workerId);
 
     if (this.currentJobId) {
-      const leaseUntil = addMs(nowIso(), config.get("lease_timeout_ms"));
+      const leaseUntil = addMs(nowIso(), config.get("lease-timeout-ms"));
       jobs.extendLease(this.currentJobId, leaseUntil);
       logger.debug("Lease Extended", { job_id: this.currentJobId, lease_until: leaseUntil });
     }
   }
 
   private async executeAndSettle(job: Job): Promise<void> {
-    const truncate = this.deps.config.get("output_truncate_bytes");
+    const truncate = this.deps.config.get("output-truncate-bytes");
     let result: ExecutionResult;
 
     try {

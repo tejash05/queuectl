@@ -1,12 +1,12 @@
 import type { SqliteDatabase } from "../database/database.js";
 import { mapJobRow, type Job, type JobRow } from "../models/Job.js";
 import type { JobEvent } from "../types/events.js";
-import type { JobStatus } from "../types/status.js";
-import { createId } from "../utils/id.js";
+import type { JobState } from "../types/status.js";
 import { nowIso } from "../utils/time.js";
 
 export interface CreateJobInput {
-  command: string[];
+  id: string;
+  command: string;
   cwd?: string | null;
   maxRetries: number;
 }
@@ -45,20 +45,24 @@ export class JobRepository {
   constructor(private readonly db: SqliteDatabase) {}
 
   create(input: CreateJobInput): Job {
-    const id = createId();
+    const existing = this.getById(input.id);
+    if (existing) {
+      throw new Error(`Job already exists: ${input.id}`);
+    }
+
     const ts = nowIso();
     this.db
       .prepare(
         `INSERT INTO jobs (
-          id, command, cwd, status, attempts, max_retries, available_at,
+          id, command, cwd, state, attempts, max_retries, available_at,
           worker_id, lease_until, last_error, exit_code, stdout, stderr,
           created_at, updated_at, started_at, finished_at
         ) VALUES (?, ?, ?, 'pending', 0, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)`,
       )
-      .run(id, JSON.stringify(input.command), input.cwd ?? null, input.maxRetries, ts, ts, ts);
+      .run(input.id, input.command, input.cwd ?? null, input.maxRetries, ts, ts, ts);
 
-    this.appendHistory(id, "enqueued", `command=${JSON.stringify(input.command)}`);
-    return this.getById(id)!;
+    this.appendHistory(input.id, "enqueued", `command=${input.command}`);
+    return this.getById(input.id)!;
   }
 
   getById(id: string): Job | null {
@@ -66,11 +70,11 @@ export class JobRepository {
     return row ? mapJobRow(row) : null;
   }
 
-  list(options: { status?: JobStatus; limit: number }): Job[] {
-    if (options.status) {
+  list(options: { state?: JobState; limit: number }): Job[] {
+    if (options.state) {
       const rows = this.db
-        .prepare(`SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?`)
-        .all(options.status, options.limit) as JobRow[];
+        .prepare(`SELECT * FROM jobs WHERE state = ? ORDER BY created_at DESC LIMIT ?`)
+        .all(options.state, options.limit) as JobRow[];
       return rows.map(mapJobRow);
     }
 
@@ -80,20 +84,20 @@ export class JobRepository {
     return rows.map(mapJobRow);
   }
 
-  countByStatus(): Record<string, number> {
+  countByState(): Record<string, number> {
     const rows = this.db
-      .prepare(`SELECT status, COUNT(*) AS count FROM jobs GROUP BY status`)
-      .all() as Array<{ status: string; count: number }>;
+      .prepare(`SELECT state, COUNT(*) AS count FROM jobs GROUP BY state`)
+      .all() as Array<{ state: string; count: number }>;
 
     const counts: Record<string, number> = {};
     for (const row of rows) {
-      counts[row.status] = row.count;
+      counts[row.state] = row.count;
     }
     return counts;
   }
 
   /**
-   * Atomically claim the oldest available pending/scheduled job.
+   * Atomically claim the oldest available pending job.
    * Uses BEGIN IMMEDIATE so concurrent writers serialize on the write lock.
    */
   claimNext(input: ClaimJobInput): Job | null {
@@ -101,7 +105,7 @@ export class JobRepository {
       const row = this.db
         .prepare(
           `UPDATE jobs
-           SET status = 'running',
+           SET state = 'processing',
                worker_id = ?,
                lease_until = ?,
                started_at = ?,
@@ -114,7 +118,7 @@ export class JobRepository {
                finished_at = NULL
            WHERE id = (
              SELECT id FROM jobs
-             WHERE status IN ('pending', 'scheduled')
+             WHERE state = 'pending'
                AND available_at <= ?
              ORDER BY created_at ASC
              LIMIT 1
@@ -140,7 +144,7 @@ export class JobRepository {
     this.db
       .prepare(
         `UPDATE jobs
-         SET status = 'completed',
+         SET state = 'completed',
              exit_code = ?,
              stdout = ?,
              stderr = ?,
@@ -155,12 +159,12 @@ export class JobRepository {
     return this.getById(input.jobId)!;
   }
 
-  markFailedTerminal(input: FailJobInput): Job {
+  markFailed(input: FailJobInput): Job {
     const ts = nowIso();
     this.db
       .prepare(
         `UPDATE jobs
-         SET status = 'failed',
+         SET state = 'failed',
              last_error = ?,
              exit_code = ?,
              stdout = ?,
@@ -189,13 +193,12 @@ export class JobRepository {
     this.db
       .prepare(
         `UPDATE jobs
-         SET status = 'dead',
+         SET state = 'dead',
              last_error = ?,
              exit_code = ?,
              stdout = ?,
              stderr = ?,
              lease_until = NULL,
-             worker_id = worker_id,
              updated_at = ?,
              finished_at = ?
          WHERE id = ?`,
@@ -214,12 +217,13 @@ export class JobRepository {
     return this.getById(input.jobId)!;
   }
 
+  /** Return job to pending with a future available_at (delayed retry). */
   scheduleRetry(input: ScheduleRetryInput): Job {
     const ts = nowIso();
     this.db
       .prepare(
         `UPDATE jobs
-         SET status = 'scheduled',
+         SET state = 'pending',
              available_at = ?,
              last_error = ?,
              exit_code = ?,
@@ -252,7 +256,9 @@ export class JobRepository {
 
   extendLease(jobId: string, leaseUntil: string): void {
     this.db
-      .prepare(`UPDATE jobs SET lease_until = ?, updated_at = ? WHERE id = ? AND status = 'running'`)
+      .prepare(
+        `UPDATE jobs SET lease_until = ?, updated_at = ? WHERE id = ? AND state = 'processing'`,
+      )
       .run(leaseUntil, nowIso(), jobId);
   }
 
@@ -261,13 +267,13 @@ export class JobRepository {
       const rows = this.db
         .prepare(
           `UPDATE jobs
-           SET status = 'pending',
+           SET state = 'pending',
                worker_id = NULL,
                lease_until = NULL,
                started_at = NULL,
                updated_at = ?,
                available_at = ?
-           WHERE status = 'running'
+           WHERE state = 'processing'
              AND lease_until IS NOT NULL
              AND lease_until < ?
            RETURNING *`,
@@ -284,12 +290,12 @@ export class JobRepository {
   }
 
   listDead(limit: number): Job[] {
-    return this.list({ status: "dead", limit });
+    return this.list({ state: "dead", limit });
   }
 
   requeueDead(jobId: string): Job | null {
     const job = this.getById(jobId);
-    if (!job || job.status !== "dead") {
+    if (!job || job.state !== "dead") {
       return null;
     }
 
@@ -297,7 +303,7 @@ export class JobRepository {
     this.db
       .prepare(
         `UPDATE jobs
-         SET status = 'pending',
+         SET state = 'pending',
              attempts = 0,
              available_at = ?,
              worker_id = NULL,
@@ -309,7 +315,7 @@ export class JobRepository {
              started_at = NULL,
              finished_at = NULL,
              updated_at = ?
-         WHERE id = ? AND status = 'dead'`,
+         WHERE id = ? AND state = 'dead'`,
       )
       .run(ts, ts, jobId);
 

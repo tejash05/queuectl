@@ -13,10 +13,14 @@ export interface ExecuteOptions {
   truncateBytes: number;
 }
 
+/**
+ * Executes the job command string via the system shell.
+ * Assignment payload is a shell command string (e.g. "echo Hello QueueCTL").
+ */
 export class JobExecutor {
   execute(job: Job, options: ExecuteOptions): Promise<ExecutionResult> {
-    const [bin, ...args] = job.command;
-    if (!bin) {
+    const command = job.command.trim();
+    if (!command) {
       return Promise.resolve({
         exitCode: 1,
         stdout: "",
@@ -25,12 +29,13 @@ export class JobExecutor {
       });
     }
 
-    logger.debug("Executing job", { job_id: job.id, bin, args });
+    logger.debug("Executing job", { job_id: job.id, command });
 
     return new Promise((resolve) => {
-      const child = spawn(bin, args, {
+      const child = spawn(command, {
         cwd: job.cwd ?? process.cwd(),
         env: process.env,
+        shell: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
 

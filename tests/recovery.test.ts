@@ -4,11 +4,11 @@ import { addMs, nowIso } from "../src/utils/time.js";
 import { createTestContext } from "./helpers.js";
 
 describe("RecoveryService", () => {
-  it("requeues jobs with expired leases", () => {
+  it("requeues processing jobs with expired leases to pending", () => {
     const ctx = createTestContext();
     try {
       const worker = ctx.workers.register({ hostname: "t", pid: 1 });
-      const created = ctx.jobs.create({ command: ["sleep", "10"], maxRetries: 3 });
+      const created = ctx.jobs.create({ id: "lease-job", command: "sleep 10", maxRetries: 3 });
       const past = addMs(nowIso(), -60_000);
       const job = ctx.jobs.claimNext({
         workerId: worker.id,
@@ -16,7 +16,6 @@ describe("RecoveryService", () => {
         now: nowIso(),
       })!;
 
-      // Force lease into the past after claim
       ctx.db.prepare(`UPDATE jobs SET lease_until = ? WHERE id = ?`).run(past, job.id);
 
       const recovery = new RecoveryService(ctx.jobs);
@@ -24,7 +23,7 @@ describe("RecoveryService", () => {
 
       expect(count).toBe(1);
       const updated = ctx.jobs.getById(created.id)!;
-      expect(updated.status).toBe("pending");
+      expect(updated.state).toBe("pending");
       expect(updated.workerId).toBeNull();
       expect(updated.leaseUntil).toBeNull();
     } finally {
@@ -36,7 +35,7 @@ describe("RecoveryService", () => {
     const ctx = createTestContext();
     try {
       const worker = ctx.workers.register({ hostname: "t", pid: 1 });
-      ctx.jobs.create({ command: ["sleep", "10"], maxRetries: 3 });
+      ctx.jobs.create({ id: "ok-lease", command: "sleep 10", maxRetries: 3 });
       const now = nowIso();
       ctx.jobs.claimNext({
         workerId: worker.id,

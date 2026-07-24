@@ -32,6 +32,12 @@ export class WorkerService {
     return worker;
   }
 
+  requestStopAll(): Worker[] {
+    const workers = this.workers.requestStopAll();
+    logger.info("Worker Stop Requested", { count: workers.length, scope: "all" });
+    return workers;
+  }
+
   markStopped(workerId: string): Worker {
     const worker = this.workers.markStopped(workerId);
     logger.info("Worker Stopped", { worker_id: worker.id });

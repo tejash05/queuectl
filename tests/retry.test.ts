@@ -4,12 +4,12 @@ import { addMs, nowIso } from "../src/utils/time.js";
 import { createTestContext } from "./helpers.js";
 
 describe("RetryService", () => {
-  it("schedules retry with exponential backoff when attempts remain", () => {
+  it("schedules retry with base^attempts delay while remaining pending", () => {
     const ctx = createTestContext();
     try {
-      ctx.config.set("backoff_base_ms", 1000);
+      ctx.config.set("backoff-base", 2);
       const worker = ctx.workers.register({ hostname: "t", pid: 1 });
-      const created = ctx.jobs.create({ command: ["false"], maxRetries: 3 });
+      const created = ctx.jobs.create({ id: "retry-me", command: "false", maxRetries: 3 });
       const now = nowIso();
       const job = ctx.jobs.claimNext({
         workerId: worker.id,
@@ -27,10 +27,11 @@ describe("RetryService", () => {
       });
 
       const updated = ctx.jobs.getById(created.id)!;
-      expect(updated.status).toBe("scheduled");
+      expect(updated.state).toBe("pending");
       expect(updated.workerId).toBeNull();
+      // attempts=1 → 2^1 = 2 seconds
       expect(new Date(updated.availableAt).getTime()).toBeGreaterThanOrEqual(
-        new Date(addMs(now, 1000)).getTime() - 50,
+        new Date(addMs(now, 2000)).getTime() - 50,
       );
     } finally {
       ctx.cleanup();
@@ -41,7 +42,7 @@ describe("RetryService", () => {
     const ctx = createTestContext();
     try {
       const worker = ctx.workers.register({ hostname: "t", pid: 1 });
-      const created = ctx.jobs.create({ command: ["false"], maxRetries: 0 });
+      const created = ctx.jobs.create({ id: "dead-me", command: "false", maxRetries: 0 });
       const now = nowIso();
       const job = ctx.jobs.claimNext({
         workerId: worker.id,
@@ -49,7 +50,6 @@ describe("RetryService", () => {
         now,
       })!;
 
-      // attempts is 1, maxRetries 0 => 1 > 0 => dead
       const retry = new RetryService(ctx.jobs, ctx.config);
       retry.handleFailure({
         job,
@@ -60,7 +60,7 @@ describe("RetryService", () => {
       });
 
       const updated = ctx.jobs.getById(created.id)!;
-      expect(updated.status).toBe("dead");
+      expect(updated.state).toBe("dead");
     } finally {
       ctx.cleanup();
     }

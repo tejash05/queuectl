@@ -40,8 +40,8 @@ export class RetryService {
       return;
     }
 
-    const baseMs = this.config.get("backoff_base_ms");
-    const delayMs = computeBackoffMs(baseMs, job.attempts);
+    const base = this.config.get("backoff-base");
+    const delayMs = computeBackoffMs(base, job.attempts);
     const availableAt = addMs(nowIso(), delayMs);
 
     this.jobs.scheduleRetry({
@@ -56,7 +56,7 @@ export class RetryService {
     logger.warn("Retry Scheduled", {
       job_id: job.id,
       attempt: job.attempts,
-      delay_ms: delayMs,
+      delay_seconds: delayMs / 1000,
       available_at: availableAt,
       error,
     });

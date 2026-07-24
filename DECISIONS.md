@@ -1,123 +1,101 @@
 # QueueCTL Engineering Decisions
 
-This document records why QueueCTL is built the way it is.
-
 ## Stack
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Language | TypeScript (strict) | Interview-ready type safety without framework bloat |
-| Runtime | Node.js >= 20 | Modern ESM, stable `child_process`, native `crypto.randomUUID` |
-| Database | SQLite via `better-sqlite3` | Zero ops, durable, synchronous API ideal for claim transactions |
-| CLI | Commander.js | Familiar subcommand UX (kubectl / docker style) |
-| Package manager | npm | Widest review familiarity |
-| Tests | Vitest | Fast Node test runner, simple TypeScript DX |
+| Language | TypeScript (strict) | Type-safe CLI without framework bloat |
+| Runtime | Node.js >= 20 | ESM, `child_process`, `crypto.randomUUID` |
+| Database | SQLite via `better-sqlite3` | Zero ops; synchronous API for atomic claims |
+| CLI | Commander.js | kubectl/docker-style subcommands |
+| Tests | Vitest | Fast Node TypeScript tests |
 
 ## Architecture
 
-Layered clean architecture:
+Layers: **CLI → Services → Repositories → SQLite**.
 
-1. **CLI** — parse args, format output, exit codes
-2. **Services** — business rules (claim, retry, DLQ, recovery)
-3. **Repositories** — SQL only
-4. **Database** — connection, migrations, schema
+CLI owns argv/exit codes only. Services own claim/retry/DLQ/recovery rules. Repositories own SQL.
 
-Dependency direction is always inward: CLI → core → repositories → database.
+## Why JSON enqueue?
 
-### Why not put SQL in services?
+The assignment contract is:
 
-Services should remain readable during a live review. SQL details (especially claim/recovery) belong behind a repository boundary so invariants can be tested independently.
+```bash
+queuectl enqueue '{"id":"job1","command":"echo Hello QueueCTL"}'
+```
 
-### Why not an Express dashboard in v1?
+The CLI parses JSON, stores `command` as a shell string, and honors the provided `id`. Generating a UUID and treating the whole JSON blob as the command would break automated graders.
 
-The product goal is a DevOps CLI. A dashboard is optional sugar and would expand scope without teaching the queue fundamentals.
+## Job states
 
-## Persistence & Concurrency
+Assignment states only:
 
-### WAL mode
+`pending | processing | completed | failed | dead`
 
-WAL allows concurrent readers while a writer holds the write lock — important when many CLI commands inspect status while workers claim jobs.
+- `processing` is the claimed/in-flight state (not `running`)
+- Delayed retries stay `pending` with a future `available_at` (no separate `scheduled` state)
 
-### `BEGIN IMMEDIATE` for claims
+## Backoff formula
 
-SQLite's default `BEGIN DEFERRED` can allow two transactions to start before either upgrades to a write lock, creating busy/retry races. `transaction().immediate()` acquires the write lock up front so only one claim mutation proceeds.
+Assignment: `delay = base ^ attempts` (seconds).
 
-Claim SQL selects the oldest available job inside the `UPDATE ... WHERE id = (SELECT ... LIMIT 1) RETURNING *` pattern. This is a single atomic statement under the immediate transaction.
+With `backoff-base=2`:
 
-### Why leases instead of only worker heartbeats?
+| attempts | delay |
+|---|---|
+| 1 | 2s |
+| 2 | 4s |
+| 3 | 8s |
 
-A worker heartbeat proves the process is alive, but jobs need their own deadline. Leases decouple "worker alive" from "this job is still owned", and make recovery correct even if a worker row is stale.
+Implemented in `utils/backoff.ts` as `base ** attempts`, converted to ms for `available_at`.
 
-Default `lease_timeout_ms=30000` plus frequent poll/recovery keeps worst-case stranded work under 60 seconds.
+## Atomic claim
 
-## Retry Semantics
+`JobRepository.claimNext()` uses `db.transaction(...).immediate()` (`BEGIN IMMEDIATE`) plus:
 
-- `attempts` increments at **claim** time (not enqueue)
-- Failure handler compares `attempts > max_retries`
-- With `max_retries=3`, a job may execute up to 4 times (initial + 3 retries)
-- Backoff is pure (`utils/backoff.ts`) and unit-tested: `base * 2^(attempt-1)`
+```sql
+UPDATE jobs SET state='processing', ... WHERE id = (
+  SELECT id FROM jobs
+  WHERE state='pending' AND available_at <= ?
+  ORDER BY created_at ASC LIMIT 1
+) RETURNING *
+```
 
-### Why snapshot `max_retries` on the job row?
+Two OS processes cannot claim the same row because SQLite serializes writers on the IMMEDIATE write lock.
 
-Changing global config must not mutate the retry budget of already-enqueued jobs. Snapshotting keeps behavior predictable.
+## Crash recovery
 
-## Dead Letter Queue
+Lease fields: `worker_id`, `lease_until`.
 
-Exhausted jobs become `dead` rather than deleted. Operators can inspect `last_error` / output and requeue deliberately (`dlq retry`). This matches production queue systems where silent discard is unacceptable.
+- Heartbeat extends `lease_until` while a job is processing
+- `kill -9` cannot run cleanup; recovery scans expired leases each poll
+- Default `lease-timeout-ms=30000` + `poll-interval-ms=1000` ⇒ worst-case recovery < 60s
 
-## Worker Process Model
+## Worker start / stop
 
-One OS process per worker. Horizontal concurrency is "run more processes", not in-process thread pools. This mirrors Sidekiq/Celery worker processes and keeps crash isolation clear.
+- `worker start` runs in the **foreground**
+- `--count N` registers N worker loops in one process (`Promise.all`)
+- Ctrl+C / SIGTERM: stop claiming, finish in-flight job, mark workers stopped
+- `worker stop` (no ID): sets **all** `active|stopping` workers to `stopping` in SQLite; running processes observe this on poll/heartbeat and drain gracefully
 
-### Graceful shutdown
+Mechanism: cooperative DB flag — not remote SIGKILL.
 
-SIGINT/SIGTERM set an in-memory stop flag. The loop stops claiming new work, finishes the current child process, then marks the worker `stopped`.
+## Configuration persistence
 
-### Cooperative stop command
+`config set max-retries` / `config set backoff-base` write to the `config` table and survive restarts.
 
-`worker stop <id>` sets `workers.status='stopping'`. The running loop observes this on poll/heartbeat. We intentionally do **not** remote-SIGKILL from the CLI — that would bypass graceful drain and is unsafe as a default.
+**Existing jobs do not inherit new `max-retries`.** Each job snapshots `max_retries` at enqueue time (or from JSON). `backoff-base` is read at failure time, so backoff base changes apply to future retries of already-enqueued jobs.
 
-### SIGKILL recovery
+## JSON stdout contract
 
-SIGKILL cannot be handled. Lease expiry is the safety net.
+`list --state … --json` writes only `JSON.stringify(array) + newline` to stdout. Logger uses stderr so graders parsing stdout see a pure JSON array.
 
-## Logging
+## Persistence
 
-Logs go to stderr (so stdout stays clean for machine-readable IDs where useful) and include stable event phrases:
+SQLite file (`QUEUECTL_DB` or `./data/queuectl.sqlite`) survives worker restart, CLI restart, and full process restart. WAL mode is enabled for concurrent readers/writers.
 
-- Worker Started / Stopped
-- Job Claimed / Completed
-- Retry Scheduled / Job Dead
-- Recovery Executed
+## Deliberate non-goals
 
-Human-readable key=value metadata keeps demos and incident debugging simple without a full structured-log stack.
-
-## Configuration
-
-All timing/retry knobs live in the `config` table with code defaults in `utils/constants.ts`. Hot paths read via `ConfigRepository` — no magic numbers scattered through services.
-
-## Output Truncation
-
-Command stdout/stderr are truncated to `output_truncate_bytes` before persistence to protect SQLite from multi-megabyte log spam.
-
-## Testing Strategy
-
-Prefer focused tests on failure modes that matter in production:
-
-- claim exclusivity
-- backoff math
-- retry → scheduled / dead transitions
-- expired lease recovery
-- stop cooperation
-
-End-to-end shell demos remain manual via the CLI.
-
-## Deliberate Non-Goals (v1)
-
-- Priority queues / delayed job APIs beyond retry scheduling
-- Distributed multi-host locking beyond a shared SQLite file
 - Web dashboard
-- Exactly-once side effects (at-least-once after crash recovery is the contract)
-- Sandboxed command execution / security policy engine
-
-These can be layered later without rewriting the core lease/claim model.
+- Exactly-once side effects (at-least-once after crash recovery)
+- Remote SIGKILL from `worker stop`

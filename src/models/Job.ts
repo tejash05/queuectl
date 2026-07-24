@@ -1,10 +1,10 @@
-import type { JobStatus } from "../types/status.js";
+import type { JobState } from "../types/status.js";
 
 export interface Job {
   id: string;
-  command: string[];
+  command: string;
   cwd: string | null;
-  status: JobStatus;
+  state: JobState;
   attempts: number;
   maxRetries: number;
   availableAt: string;
@@ -20,11 +20,20 @@ export interface Job {
   finishedAt: string | null;
 }
 
+/** Public JSON contract for list --json and similar. */
+export interface JobJson {
+  id: string;
+  command: string;
+  state: JobState;
+  attempts: number;
+  max_retries: number;
+}
+
 export interface JobRow {
   id: string;
   command: string;
   cwd: string | null;
-  status: JobStatus;
+  state: JobState;
   attempts: number;
   max_retries: number;
   available_at: string;
@@ -43,9 +52,9 @@ export interface JobRow {
 export function mapJobRow(row: JobRow): Job {
   return {
     id: row.id,
-    command: JSON.parse(row.command) as string[],
+    command: normalizeCommand(row.command),
     cwd: row.cwd,
-    status: row.status,
+    state: row.state,
     attempts: row.attempts,
     maxRetries: row.max_retries,
     availableAt: row.available_at,
@@ -60,4 +69,30 @@ export function mapJobRow(row: JobRow): Job {
     startedAt: row.started_at,
     finishedAt: row.finished_at,
   };
+}
+
+export function toJobJson(job: Job): JobJson {
+  return {
+    id: job.id,
+    command: job.command,
+    state: job.state,
+    attempts: job.attempts,
+    max_retries: job.maxRetries,
+  };
+}
+
+/** Support legacy rows that stored argv JSON arrays. */
+function normalizeCommand(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed) && parsed.every((p) => typeof p === "string")) {
+        return parsed.join(" ");
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return raw;
 }

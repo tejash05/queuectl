@@ -3,11 +3,11 @@ import { addMs, nowIso } from "../src/utils/time.js";
 import { createTestContext } from "./helpers.js";
 
 describe("atomic job claiming", () => {
-  it("claims the oldest available job", () => {
+  it("claims the oldest available job as processing", () => {
     const ctx = createTestContext();
     try {
-      const first = ctx.jobs.create({ command: ["echo", "one"], maxRetries: 3 });
-      ctx.jobs.create({ command: ["echo", "two"], maxRetries: 3 });
+      const first = ctx.jobs.create({ id: "job-a", command: "echo one", maxRetries: 3 });
+      ctx.jobs.create({ id: "job-b", command: "echo two", maxRetries: 3 });
 
       const worker = ctx.workers.register({ hostname: "test", pid: 1 });
       const now = nowIso();
@@ -18,7 +18,7 @@ describe("atomic job claiming", () => {
       });
 
       expect(claimed?.id).toBe(first.id);
-      expect(claimed?.status).toBe("running");
+      expect(claimed?.state).toBe("processing");
       expect(claimed?.attempts).toBe(1);
       expect(claimed?.workerId).toBe(worker.id);
     } finally {
@@ -29,7 +29,7 @@ describe("atomic job claiming", () => {
   it("does not allow two workers to claim the same job", () => {
     const ctx = createTestContext();
     try {
-      ctx.jobs.create({ command: ["echo", "only"], maxRetries: 3 });
+      ctx.jobs.create({ id: "only", command: "echo only", maxRetries: 3 });
       const w1 = ctx.workers.register({ hostname: "a", pid: 1 });
       const w2 = ctx.workers.register({ hostname: "b", pid: 2 });
       const now = nowIso();
@@ -52,14 +52,12 @@ describe("atomic job claiming", () => {
     }
   });
 
-  it("skips scheduled jobs that are not yet available", () => {
+  it("skips pending jobs that are not yet available", () => {
     const ctx = createTestContext();
     try {
-      const job = ctx.jobs.create({ command: ["echo", "later"], maxRetries: 3 });
+      const job = ctx.jobs.create({ id: "later", command: "echo later", maxRetries: 3 });
       const future = addMs(nowIso(), 60_000);
-      ctx.db
-        .prepare(`UPDATE jobs SET status = 'scheduled', available_at = ? WHERE id = ?`)
-        .run(future, job.id);
+      ctx.db.prepare(`UPDATE jobs SET available_at = ? WHERE id = ?`).run(future, job.id);
 
       const worker = ctx.workers.register({ hostname: "test", pid: 1 });
       const claimed = ctx.jobs.claimNext({

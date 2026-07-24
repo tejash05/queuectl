@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   command TEXT NOT NULL,
   cwd TEXT,
-  status TEXT NOT NULL CHECK (
-    status IN ('pending', 'scheduled', 'running', 'completed', 'failed', 'dead')
+  state TEXT NOT NULL CHECK (
+    state IN ('pending', 'processing', 'completed', 'failed', 'dead')
   ),
   attempts INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL,
@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS job_history (
   created_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_jobs_status_available_at
-  ON jobs (status, available_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_state_available_at
+  ON jobs (state, available_at);
 
 CREATE INDEX IF NOT EXISTS idx_jobs_worker_id
   ON jobs (worker_id);

@@ -4,7 +4,7 @@
   "description": "Production-inspired CLI background job queue system",
   "type": "module",
   "bin": {
-    "queuectl": "./dist/index.js"
+    "queuectl": "./bin/queuectl"
   },
   "main": "./dist/index.js",
   "scripts": {
@@ -12,6 +12,7 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "queuectl": "tsx src/index.ts",
+    "postinstall": "chmod +x bin/queuectl",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

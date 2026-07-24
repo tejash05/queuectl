@@ -5,7 +5,7 @@ import { WorkerService } from "../core/WorkerService.js";
 import { ConfigRepository } from "../repositories/ConfigRepository.js";
 import { JobRepository } from "../repositories/JobRepository.js";
 import { WorkerRepository } from "../repositories/WorkerRepository.js";
-import { JOB_STATUSES } from "../types/status.js";
+import { JOB_STATES } from "../types/status.js";
 import { EXIT_ERROR } from "../utils/constants.js";
 import { failure, printTable, truncate } from "./format.js";
 
@@ -24,8 +24,8 @@ export function registerStatusCommand(program: Command): void {
 
         console.log("Jobs");
         printTable(
-          ["Status", "Count"],
-          JOB_STATUSES.map((status) => [status, String(jobCounts[status] ?? 0)]),
+          ["State", "Count"],
+          JOB_STATES.map((state) => [state, String(jobCounts[state] ?? 0)]),
         );
 
         console.log("\nWorkers");

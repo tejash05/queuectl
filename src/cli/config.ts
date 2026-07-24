@@ -34,7 +34,7 @@ export function registerConfigCommand(program: Command): void {
   config
     .command("set")
     .description("Set a configuration value")
-    .argument("<key>", "Config key")
+    .argument("<key>", "Config key (e.g. max-retries, backoff-base)")
     .argument("<value>", "Config value")
     .action((key: string, value: string) => {
       const db = openDatabase();

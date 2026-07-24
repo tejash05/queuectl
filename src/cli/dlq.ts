@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { closeDatabase, openDatabase } from "../database/database.js";
 import { JobService } from "../core/JobService.js";
+import { toJobJson } from "../models/Job.js";
 import { ConfigRepository } from "../repositories/ConfigRepository.js";
 import { JobRepository } from "../repositories/JobRepository.js";
 import { EXIT_ERROR, EXIT_USAGE } from "../utils/constants.js";
@@ -12,8 +13,9 @@ export function registerDlqCommand(program: Command): void {
   dlq
     .command("list")
     .description("List dead-lettered jobs")
+    .option("--json", "Print only a JSON array to stdout")
     .option("--limit <n>", "Maximum rows", "50")
-    .action((options: { limit: string }) => {
+    .action((options: { json?: boolean; limit: string }) => {
       const limit = Number(options.limit);
       if (!Number.isInteger(limit) || limit <= 0) {
         failure("--limit must be a positive integer");
@@ -26,6 +28,11 @@ export function registerDlqCommand(program: Command): void {
         const service = new JobService(new JobRepository(db), new ConfigRepository(db));
         const jobs = service.listDead(limit);
 
+        if (options.json) {
+          process.stdout.write(`${JSON.stringify(jobs.map(toJobJson))}\n`);
+          return;
+        }
+
         if (jobs.length === 0) {
           console.log("DLQ is empty.");
           return;
@@ -36,7 +43,7 @@ export function registerDlqCommand(program: Command): void {
           jobs.map((job) => [
             truncate(job.id, 36),
             `${job.attempts}/${job.maxRetries}`,
-            truncate(job.command.join(" "), 40),
+            truncate(job.command, 40),
             truncate(job.lastError ?? "-", 40),
             job.finishedAt ?? "-",
           ]),

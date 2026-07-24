@@ -68,6 +68,20 @@ export class WorkerRepository {
     return this.getById(workerId)!;
   }
 
+  /** Cooperative stop for every active/stopping worker (assignment: `worker stop`). */
+  requestStopAll(): Worker[] {
+    const ts = nowIso();
+    this.db
+      .prepare(
+        `UPDATE workers
+         SET status = 'stopping', last_heartbeat_at = ?
+         WHERE status IN ('active', 'stopping')`,
+      )
+      .run(ts);
+
+    return this.list("stopping");
+  }
+
   markStopped(workerId: string): Worker {
     const ts = nowIso();
     this.db

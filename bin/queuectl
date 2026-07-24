@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Prefer TypeScript source so `npm link` always matches the working tree.
+if [[ -x "$ROOT/node_modules/.bin/tsx" && -f "$ROOT/src/index.ts" ]]; then
+  exec "$ROOT/node_modules/.bin/tsx" "$ROOT/src/index.ts" "$@"
+fi
+
+if [[ -f "$ROOT/dist/index.js" ]]; then
+  exec node "$ROOT/dist/index.js" "$@"
+fi
+
+echo "queuectl: missing tsx and dist build. Run npm install && npm run build." >&2
+exit 1

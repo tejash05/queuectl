@@ -8,7 +8,7 @@ import { WorkerService } from "../core/WorkerService.js";
 import { ConfigRepository } from "../repositories/ConfigRepository.js";
 import { JobRepository } from "../repositories/JobRepository.js";
 import { WorkerRepository } from "../repositories/WorkerRepository.js";
-import { EXIT_ERROR } from "../utils/constants.js";
+import { EXIT_ERROR, EXIT_USAGE } from "../utils/constants.js";
 import { onShutdown } from "../utils/signals.js";
 import { failure, success } from "./format.js";
 
@@ -17,39 +17,52 @@ export function registerWorkerCommand(program: Command): void {
 
   worker
     .command("start")
-    .description("Start a worker process")
-    .option("--id <workerId>", "Optional worker ID")
-    .action(async (options: { id?: string }) => {
+    .description("Start worker process(es) in the foreground")
+    .option("--count <n>", "Number of concurrent workers", "1")
+    .action(async (options: { count: string }) => {
+      const count = Number(options.count);
+      if (!Number.isInteger(count) || count < 1) {
+        failure("--count must be a positive integer");
+        process.exitCode = EXIT_USAGE;
+        return;
+      }
+
       const db = openDatabase();
       const config = new ConfigRepository(db);
       const jobs = new JobRepository(db);
       const workers = new WorkerRepository(db);
       const workerService = new WorkerService(workers);
+      const recovery = new RecoveryService(jobs);
+      const retry = new RetryService(jobs, config);
+      const executor = new JobExecutor();
 
-      let scheduler: Scheduler | null = null;
+      const schedulers: Scheduler[] = [];
       let disposeSignals: (() => void) | null = null;
 
       try {
-        const registered = workerService.register(
-          options.id ? { id: options.id } : undefined,
-        );
-        success(`Worker ${registered.id} started (pid ${registered.pid})`);
+        for (let i = 0; i < count; i += 1) {
+          const registered = workerService.register();
+          const scheduler = new Scheduler({
+            workerId: registered.id,
+            workerService,
+            jobs,
+            config,
+            recovery,
+            retry,
+            executor,
+          });
+          schedulers.push(scheduler);
+        }
 
-        scheduler = new Scheduler({
-          workerId: registered.id,
-          workerService,
-          jobs,
-          config,
-          recovery: new RecoveryService(jobs),
-          retry: new RetryService(jobs, config),
-          executor: new JobExecutor(),
-        });
+        success(`Started ${count} worker(s) in foreground (pid ${process.pid})`);
 
         disposeSignals = onShutdown((signal) => {
-          scheduler?.requestShutdown(signal);
+          for (const scheduler of schedulers) {
+            scheduler.requestShutdown(signal);
+          }
         });
 
-        await scheduler.run();
+        await Promise.all(schedulers.map((scheduler) => scheduler.run()));
       } catch (error) {
         failure(error instanceof Error ? error.message : String(error));
         process.exitCode = EXIT_ERROR;
@@ -61,14 +74,13 @@ export function registerWorkerCommand(program: Command): void {
 
   worker
     .command("stop")
-    .description("Request a worker to stop gracefully")
-    .argument("<workerId>", "Worker ID to stop")
-    .action((workerId: string) => {
+    .description("Request all active workers to stop gracefully")
+    .action(() => {
       const db = openDatabase();
       try {
         const workerService = new WorkerService(new WorkerRepository(db));
-        const workerRow = workerService.requestStop(workerId);
-        success(`Stop requested for worker ${workerRow.id} (status=${workerRow.status})`);
+        const stopped = workerService.requestStopAll();
+        success(`Stop requested for ${stopped.length} worker(s)`);
       } catch (error) {
         failure(error instanceof Error ? error.message : String(error));
         process.exitCode = EXIT_ERROR;

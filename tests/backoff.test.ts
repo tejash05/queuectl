@@ -1,19 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { computeBackoffMs } from "../src/utils/backoff.js";
+import { computeBackoffMs, computeBackoffSeconds } from "../src/utils/backoff.js";
 
-describe("computeBackoffMs", () => {
-  it("uses base delay for first attempt", () => {
-    expect(computeBackoffMs(1000, 1)).toBe(1000);
+describe("computeBackoffSeconds", () => {
+  it("uses base^attempts (assignment contract)", () => {
+    expect(computeBackoffSeconds(2, 1)).toBe(2);
+    expect(computeBackoffSeconds(2, 2)).toBe(4);
+    expect(computeBackoffSeconds(2, 3)).toBe(8);
   });
 
-  it("doubles for each subsequent attempt", () => {
-    expect(computeBackoffMs(1000, 2)).toBe(2000);
-    expect(computeBackoffMs(1000, 3)).toBe(4000);
-    expect(computeBackoffMs(1000, 4)).toBe(8000);
+  it("converts to milliseconds", () => {
+    expect(computeBackoffMs(2, 1)).toBe(2000);
+    expect(computeBackoffMs(2, 2)).toBe(4000);
+    expect(computeBackoffMs(2, 3)).toBe(8000);
   });
 
   it("rejects invalid inputs", () => {
-    expect(() => computeBackoffMs(-1, 1)).toThrow();
-    expect(() => computeBackoffMs(1000, 0)).toThrow();
+    expect(() => computeBackoffSeconds(-1, 1)).toThrow();
+    expect(() => computeBackoffSeconds(2, 0)).toThrow();
   });
 });

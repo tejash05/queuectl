@@ -1,12 +1,16 @@
-/** Default configuration values seeded into the config table. */
+/**
+ * Durable config defaults.
+ * Assignment CLI keys use hyphens: max-retries, backoff-base.
+ * backoff-base is the exponent base for delay = base^attempts (seconds).
+ */
 export const DEFAULT_CONFIG = {
-  max_retries: 3,
-  backoff_base_ms: 1000,
-  lease_timeout_ms: 30_000,
-  heartbeat_interval_ms: 5_000,
-  poll_interval_ms: 1_000,
-  output_truncate_bytes: 8_192,
-  shutdown_grace_ms: 10_000,
+  "max-retries": 3,
+  "backoff-base": 2,
+  "lease-timeout-ms": 30_000,
+  "heartbeat-interval-ms": 5_000,
+  "poll-interval-ms": 1_000,
+  "output-truncate-bytes": 8_192,
+  "shutdown-grace-ms": 10_000,
 } as const;
 
 export type ConfigKey = keyof typeof DEFAULT_CONFIG;

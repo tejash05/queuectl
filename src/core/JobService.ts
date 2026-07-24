@@ -1,12 +1,14 @@
-import type { Job } from "../models/Job.js";
+import { toJobJson, type Job, type JobJson } from "../models/Job.js";
 import { ConfigRepository } from "../repositories/ConfigRepository.js";
 import { JobRepository } from "../repositories/JobRepository.js";
-import type { JobStatus } from "../types/status.js";
+import type { JobState } from "../types/status.js";
+import { createId } from "../utils/id.js";
 import { logger } from "../utils/logger.js";
 
-export interface EnqueueOptions {
-  command: string[];
-  cwd?: string;
+export interface EnqueuePayload {
+  id?: string;
+  command: string;
+  max_retries?: number;
 }
 
 export class JobService {
@@ -15,21 +17,46 @@ export class JobService {
     private readonly config: ConfigRepository,
   ) {}
 
-  enqueue(options: EnqueueOptions): Job {
-    if (options.command.length === 0) {
-      throw new Error("Command is required. Usage: queuectl enqueue -- <command> [args...]");
+  enqueueFromJson(raw: string): Job {
+    let payload: EnqueuePayload;
+    try {
+      payload = JSON.parse(raw) as EnqueuePayload;
+    } catch {
+      throw new Error(
+        `Invalid JSON. Usage: queuectl enqueue '{"id":"job1","command":"echo hello"}'`,
+      );
     }
 
-    const maxRetries = this.config.get("max_retries");
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("Enqueue payload must be a JSON object");
+    }
+
+    if (typeof payload.command !== "string" || payload.command.trim() === "") {
+      throw new Error('Enqueue JSON must include a non-empty string "command"');
+    }
+
+    if (payload.id !== undefined && (typeof payload.id !== "string" || payload.id.trim() === "")) {
+      throw new Error('Enqueue JSON "id" must be a non-empty string when provided');
+    }
+
+    const maxRetries =
+      typeof payload.max_retries === "number"
+        ? payload.max_retries
+        : this.config.get("max-retries");
+
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new Error("max_retries must be a non-negative integer");
+    }
+
     const job = this.jobs.create({
-      command: options.command,
-      cwd: options.cwd ?? null,
+      id: payload.id?.trim() || createId(),
+      command: payload.command,
       maxRetries,
     });
 
     logger.info("Job Enqueued", {
       job_id: job.id,
-      command: job.command.join(" "),
+      command: job.command,
       max_retries: job.maxRetries,
     });
 
@@ -40,12 +67,16 @@ export class JobService {
     return this.jobs.getById(id);
   }
 
-  list(options: { status?: JobStatus; limit: number }): Job[] {
+  list(options: { state?: JobState; limit: number }): Job[] {
     return this.jobs.list(options);
   }
 
+  listJson(options: { state?: JobState; limit: number }): JobJson[] {
+    return this.list(options).map(toJobJson);
+  }
+
   counts(): Record<string, number> {
-    return this.jobs.countByStatus();
+    return this.jobs.countByState();
   }
 
   listDead(limit: number): Job[] {

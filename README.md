@@ -4,46 +4,55 @@ Production-inspired CLI background job queue for Node.js.
 
 A miniature of Sidekiq / BullMQ / Celery / SQS workers — durable SQLite storage, multi-worker atomic claiming, retries, dead-letter queue, lease-based crash recovery, and graceful shutdown.
 
-## Features
-
-- Job queue with shell-command payloads
-- Multiple concurrent worker processes
-- Atomic job claiming (`BEGIN IMMEDIATE`)
-- SQLite persistence (WAL mode)
-- Exponential backoff retries
-- Dead letter queue + operator retry
-- Lease-based crash recovery (< 60s worst case)
-- Worker heartbeats + lease extension
-- Graceful SIGINT/SIGTERM shutdown
-- Cooperative `worker stop`
-- Persistent configuration
-- Status / list / DLQ commands
-
-## Quick Start
+## Setup
 
 ```bash
 npm install
+npm link          # exposes `queuectl` on your PATH
+# or without link:
 npm run queuectl -- --help
-
-# Enqueue work
-npm run queuectl -- enqueue -- echo "hello from QueueCTL"
-
-# Start a worker (separate terminal)
-npm run queuectl -- worker start
-
-# Inspect
-npm run queuectl -- status
-npm run queuectl -- list
-```
-
-Build / global-style usage:
-
-```bash
-npm run build
-node dist/index.js --help
 ```
 
 Database path defaults to `./data/queuectl.sqlite`. Override with `QUEUECTL_DB`.
+
+## CLI (assignment contract)
+
+```bash
+queuectl enqueue '{"id":"job1","command":"echo Hello QueueCTL"}'
+
+queuectl worker start
+queuectl worker start --count 3
+
+queuectl worker stop
+
+queuectl status
+
+queuectl list --state pending
+queuectl list --state pending --json
+
+queuectl dlq list
+queuectl dlq retry job1
+
+queuectl config set max-retries 3
+queuectl config set backoff-base 2
+queuectl config get
+```
+
+`list --json` prints **only** a JSON array to stdout (no logs, headers, or colors). Operational logs always go to stderr.
+
+## Features
+
+- JSON enqueue with client-provided job IDs
+- Concurrent workers via `--count`
+- Atomic job claiming (`BEGIN IMMEDIATE`)
+- SQLite persistence (WAL mode)
+- Exponential backoff: `delay_seconds = backoff-base ^ attempts`
+- Dead letter queue + operator retry
+- Lease-based crash recovery (< 60s worst case with defaults)
+- Worker heartbeats + lease extension
+- Graceful SIGINT/SIGTERM shutdown
+- Cooperative `worker stop` from another terminal
+- Persistent configuration
 
 ## Architecture
 
@@ -61,7 +70,7 @@ Database path defaults to `./data/queuectl.sqlite`. Override with `QUEUECTL_DB`.
 └─────────────────────────────────────────────────────────┘
 ```
 
-Dependency rule: CLI → core → repositories → database. See [docs/architecture.md](./docs/architecture.md) and [DECISIONS.md](./DECISIONS.md).
+See [docs/architecture.md](./docs/architecture.md) and [DECISIONS.md](./DECISIONS.md).
 
 ## Database Schema
 
@@ -69,14 +78,13 @@ Dependency rule: CLI → core → repositories → database. See [docs/architect
 
 | Column | Purpose |
 |---|---|
-| `id` | UUID |
-| `command` | JSON argv array |
-| `status` | pending / scheduled / running / completed / failed / dead |
+| `id` | Client-provided or generated ID |
+| `command` | Shell command string |
+| `state` | pending / processing / completed / failed / dead |
 | `attempts` / `max_retries` | retry bookkeeping |
-| `available_at` | delay gate for scheduled retries |
+| `available_at` | delay gate for retries |
 | `worker_id` / `lease_until` | lease ownership |
-| `stdout` / `stderr` / `exit_code` / `last_error` | execution outcome |
-| timestamps | created / updated / started / finished |
+| timestamps / output fields | audit + execution outcome |
 
 ### `workers`
 
@@ -84,99 +92,42 @@ Worker identity, pid, status (`active|stopping|stopped`), heartbeat timestamps.
 
 ### `config`
 
-Key/value durable settings (seeded on first open).
+Key/value durable settings. Assignment keys: `max-retries`, `backoff-base`.
 
 ### `job_history`
 
-Append-only audit events (enqueued, claimed, completed, retry_scheduled, dead, recovered, requeued).
+Append-only audit events.
 
 ## Worker Lifecycle
 
 ```text
-start → register → heartbeat loop
+start [--count N] → register N workers → heartbeat loops
                  → recover expired leases
-                 → claim job (atomic)
-                 → execute command
-                 → complete | schedule retry | dead
-                 → repeat
-SIGINT/SIGTERM/stop → finish current job → mark stopped
+                 → claim job (atomic) → state=processing
+                 → execute shell command
+                 → completed | pending(delayed) | dead
+SIGINT / worker stop → finish current job → mark stopped
 ```
 
 ## Retry Flow
 
 ```text
-failure
-  ├─ attempts <= max_retries → status=scheduled, available_at=now+backoff
-  └─ attempts >  max_retries → status=dead (DLQ)
+failure (attempts already incremented at claim)
+  ├─ attempts <= max_retries → state=pending, available_at=now+base^attempts seconds
+  └─ attempts >  max_retries → state=dead (DLQ)
 ```
 
-Backoff: `backoff_base_ms * 2^(attempts - 1)`.
+Example with `backoff-base=2`: attempt 1 → 2s, attempt 2 → 4s, attempt 3 → 8s.
+
+Existing jobs keep their snapshotted `max_retries`. New `config set max-retries` applies to newly enqueued jobs only (unless the enqueue JSON overrides `max_retries`).
 
 ## Crash Recovery
 
-1. Worker claims job and sets `lease_until`
-2. Heartbeats extend the lease while running
-3. If the process is killed, heartbeats stop
-4. Another worker (or the next poll) recovers rows where `status=running AND lease_until < now`
-5. Job returns to `pending` for re-execution
-
-Defaults: `lease_timeout_ms=30000`, poll every `1000ms` → worst-case recovery < 60s.
-
-## CLI Reference
-
-```text
-queuectl enqueue -- <command> [args...]
-queuectl worker start [--id <id>]
-queuectl worker stop <worker_id>
-queuectl status
-queuectl list [--status <status>] [--limit N]
-queuectl dlq list [--limit N]
-queuectl dlq retry <job_id>
-queuectl dlq retry --all
-queuectl config get [key]
-queuectl config set <key> <value>
-```
-
-### Configuration Keys
-
-| Key | Default | Meaning |
-|---|---|---|
-| `max_retries` | `3` | Retries allowed after claim failures |
-| `backoff_base_ms` | `1000` | Base exponential backoff |
-| `lease_timeout_ms` | `30000` | Job lease duration |
-| `heartbeat_interval_ms` | `5000` | Worker/job heartbeat cadence |
-| `poll_interval_ms` | `1000` | Idle poll sleep |
-| `output_truncate_bytes` | `8192` | Max stored stdout/stderr |
-| `shutdown_grace_ms` | `10000` | Reserved for future forced-kill grace |
-
-## Usage Examples
-
-```bash
-# Enqueue a few jobs
-npm run queuectl -- enqueue -- echo job-1
-npm run queuectl -- enqueue -- sh -c "echo fail; exit 1"
-npm run queuectl -- enqueue -- sleep 2
-
-# Run two workers
-npm run queuectl -- worker start &
-npm run queuectl -- worker start &
-
-# Watch queue
-npm run queuectl -- status
-npm run queuectl -- list --status completed
-
-# Tune retries
-npm run queuectl -- config set max_retries 1
-npm run queuectl -- config set backoff_base_ms 500
-
-# Dead letter ops
-npm run queuectl -- dlq list
-npm run queuectl -- dlq retry --all
-
-# Cooperative stop
-npm run queuectl -- status   # copy worker id
-npm run queuectl -- worker stop <worker_id>
-```
+1. Claim sets `lease_until = now + lease-timeout-ms` (default 30s)
+2. Heartbeats extend the lease while processing
+3. `kill -9` stops heartbeats; lease expires
+4. Another worker recovers `state=processing AND lease_until < now` → `pending`
+5. Worst case with defaults: < 60 seconds
 
 ## Testing
 
@@ -184,8 +135,6 @@ npm run queuectl -- worker stop <worker_id>
 npm test
 npm run typecheck
 ```
-
-Coverage focuses on production-risk paths: atomic claim, backoff, retry/DLQ transition, lease recovery, and stop cooperation.
 
 ## Project Structure
 
@@ -200,10 +149,7 @@ src/
   types/         # shared unions
 tests/
 docs/
+bin/queuectl
 README.md
 DECISIONS.md
 ```
-
-## Engineering Notes
-
-QueueCTL is built for **interview-ready clarity**: small modules, repository/service boundaries, configuration-driven timeouts, and explicit recovery semantics. See [DECISIONS.md](./DECISIONS.md) for the full rationale.
