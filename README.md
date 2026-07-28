@@ -23,6 +23,14 @@ npx tsx src/index.ts --help
 
 Database path defaults to `./data/queuectl.sqlite`. Override with `QUEUECTL_DB`.
 
+## Demo recording
+
+> **TODO:** Replace this with your uploaded demo URL (YouTube / Google Drive / Loom).
+>
+> Demo link: _<add recording URL before submission>_
+>
+> Suggested demo script: enqueue → `worker start --count 2` → `status` / `list --json` → Ctrl+C drain → `kill -9` recovery (`Stale Job Recovered` log) → `dlq` / `config set`.
+
 ## CLI (assignment contract)
 
 ```bash
@@ -139,12 +147,45 @@ Existing jobs keep their snapshotted `max_retries`. New `config set max-retries`
 
 Look for these stderr logs in a live demo: `Job Claimed` → `Stale Job Recovered` → `Job Claimed` (new worker) → `Job Completed`.
 
+## Configuration
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max-retries` | `3` | Retry budget snapshotted onto each job at enqueue |
+| `backoff-base` | `2` | Seconds delay = `base ^ attempts` |
+| `lease-timeout-ms` | `30000` | Job lease / crash recovery window (~30s worst case) |
+| `heartbeat-interval-ms` | `5000` | Worker + lease heartbeat cadence |
+| `poll-interval-ms` | `1000` | Idle poll sleep |
+
+```bash
+queuectl config set max-retries 3
+queuectl config set backoff-base 2
+queuectl config get
+```
+
 ## Testing
 
 ```bash
 npm test
 npm run typecheck
 ```
+
+## Assumptions
+
+- Single-machine deployment sharing one SQLite file (not a multi-region cluster).
+- Job payloads are shell command strings executed with `shell: true`.
+- Operators trust the host; there is no command sandbox or auth layer.
+- Demo recording is provided separately via the Demo link above.
+- Automated graders parse `list --json` from **stdout only**; logs go to stderr.
+
+## Limitations
+
+- SQLite write lock limits multi-worker throughput (by design for this assignment).
+- Crash recovery is **at-least-once**: a job may run again after SIGKILL.
+- `worker stop` is cooperative (DB flag), not instant remote kill.
+- Automatic retries use `pending` + `available_at` rather than parking in `failed` (see DECISIONS.md).
+- Not a distributed queue; Redis/NATS would be needed for multi-host workers.
+- No web dashboard in this submission.
 
 ## Project Structure
 
