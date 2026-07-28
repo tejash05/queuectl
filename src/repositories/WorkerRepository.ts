@@ -90,6 +90,26 @@ export class WorkerRepository {
     return this.getById(workerId)!;
   }
 
+  /**
+   * Mark workers whose heartbeats expired as stopped.
+   * Used after SIGKILL/crash when markStopped never ran.
+   */
+  markStaleAsStopped(staleBefore: string, now: string = nowIso()): Worker[] {
+    const rows = this.db
+      .prepare(
+        `UPDATE workers
+         SET status = 'stopped',
+             stopped_at = ?,
+             last_heartbeat_at = last_heartbeat_at
+         WHERE status IN ('active', 'stopping')
+           AND last_heartbeat_at < ?
+         RETURNING *`,
+      )
+      .all(now, staleBefore) as WorkerRow[];
+
+    return rows.map(mapWorkerRow);
+  }
+
   countByStatus(): Record<string, number> {
     const rows = this.db
       .prepare(`SELECT status, COUNT(*) AS count FROM workers GROUP BY status`)

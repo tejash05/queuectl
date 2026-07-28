@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { closeDatabase, openDatabase } from "../database/database.js";
 import { JobService } from "../core/JobService.js";
+import { RecoveryService } from "../core/RecoveryService.js";
 import { WorkerService } from "../core/WorkerService.js";
 import { ConfigRepository } from "../repositories/ConfigRepository.js";
 import { JobRepository } from "../repositories/JobRepository.js";
@@ -16,8 +17,14 @@ export function registerStatusCommand(program: Command): void {
     .action(() => {
       const db = openDatabase();
       try {
-        const jobService = new JobService(new JobRepository(db), new ConfigRepository(db));
-        const workerService = new WorkerService(new WorkerRepository(db));
+        const config = new ConfigRepository(db);
+        const jobs = new JobRepository(db);
+        const workers = new WorkerRepository(db);
+        const jobService = new JobService(jobs, config);
+        const workerService = new WorkerService(workers);
+
+        // Reclaim expired job leases and mark SIGKILL zombies stopped before display.
+        new RecoveryService(jobs, workers, config).recover();
 
         const jobCounts = jobService.counts();
         const workerCounts = workerService.counts();
@@ -37,12 +44,12 @@ export function registerStatusCommand(program: Command): void {
           ]),
         );
 
-        const activeWorkers = workerService.list().filter((w) => w.status !== "stopped");
-        if (activeWorkers.length > 0) {
+        const liveWorkers = workerService.list().filter((w) => w.status !== "stopped");
+        if (liveWorkers.length > 0) {
           console.log("\nActive / Stopping Workers");
           printTable(
             ["ID", "Host", "PID", "Status", "Heartbeat"],
-            activeWorkers.map((w) => [
+            liveWorkers.map((w) => [
               truncate(w.id, 36),
               w.hostname,
               String(w.pid),

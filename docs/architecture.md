@@ -19,8 +19,9 @@ CLI (src/cli) → Services (src/core) → Repositories → SQLite
 - Heartbeat refreshes `lease_until` while job runs
 - If worker dies (`kill -9`), lease expires
 - Recovery sets expired `processing` jobs back to `pending`
+- Separately, workers with stale heartbeats are marked `stopped` so `status` does not show zombies
 
-Default timeout 30s keeps worst-case recovery under 60 seconds.
+Default timeout 30s keeps worst-case job recovery under 60 seconds.
 
 ## Retry / DLQ
 

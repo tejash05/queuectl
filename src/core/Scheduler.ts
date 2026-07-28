@@ -57,7 +57,7 @@ export class Scheduler {
           break;
         }
 
-        this.deps.recovery.recoverExpiredLeases();
+        this.deps.recovery.recover();
         this.tickHeartbeat();
 
         const leaseTimeout = config.get("lease-timeout-ms");

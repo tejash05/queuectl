@@ -32,7 +32,7 @@ export function registerWorkerCommand(program: Command): void {
       const jobs = new JobRepository(db);
       const workers = new WorkerRepository(db);
       const workerService = new WorkerService(workers);
-      const recovery = new RecoveryService(jobs);
+      const recovery = new RecoveryService(jobs, workers, config);
       const retry = new RetryService(jobs, config);
       const executor = new JobExecutor();
 

@@ -71,6 +71,18 @@ Lease fields: `worker_id`, `lease_until`.
 - `kill -9` cannot run cleanup; recovery scans expired leases each poll
 - Default `lease-timeout-ms=30000` + `poll-interval-ms=1000` ⇒ worst-case recovery < 60s
 
+### Stale worker rows (zombies)
+
+Job recovery and worker-row cleanup are separate:
+
+- **Jobs** are reclaimed via expired `lease_until` (source of truth for work)
+- **Workers** left `active` after SIGKILL are marked `stopped` when
+  `last_heartbeat_at` is older than `max(lease-timeout-ms, heartbeat-interval-ms * 3)`
+
+Without worker cleanup, `queuectl status` would report days-old zombies as active.
+That is a display/ops bug — it does not block job reclaim. Cleanup runs on the
+worker poll loop and on `status` so operators always see truthful liveness.
+
 ## Worker start / stop
 
 - `worker start` runs in the **foreground**
