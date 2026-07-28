@@ -62,9 +62,10 @@ export class Scheduler {
 
         const leaseTimeout = config.get("lease-timeout-ms");
         const now = nowIso();
+        const leaseUntil = addMs(now, leaseTimeout);
         const job = this.deps.jobs.claimNext({
           workerId,
-          leaseUntil: addMs(now, leaseTimeout),
+          leaseUntil,
           now,
         });
 
@@ -76,7 +77,9 @@ export class Scheduler {
         logger.info("Job Claimed", {
           job_id: job.id,
           worker_id: workerId,
+          pid: process.pid,
           attempt: job.attempts,
+          lease_until: job.leaseUntil ?? leaseUntil,
           command: job.command,
         });
 
@@ -106,6 +109,7 @@ export class Scheduler {
 
   private async executeAndSettle(job: Job): Promise<void> {
     const truncate = this.deps.config.get("output-truncate-bytes");
+    const startedMs = job.startedAt ? new Date(job.startedAt).getTime() : Date.now();
     let result: ExecutionResult;
 
     try {
@@ -119,6 +123,8 @@ export class Scheduler {
       };
     }
 
+    const durationMs = Math.max(0, Date.now() - startedMs);
+
     if (result.exitCode === 0 && !result.error) {
       this.deps.jobs.markCompleted({
         jobId: job.id,
@@ -126,7 +132,13 @@ export class Scheduler {
         stdout: result.stdout || null,
         stderr: result.stderr || null,
       });
-      logger.info("Job Completed", { job_id: job.id, exit_code: result.exitCode });
+      logger.info("Job Completed", {
+        job_id: job.id,
+        worker_id: this.deps.workerId,
+        attempt: job.attempts,
+        duration_ms: durationMs,
+        exit_code: result.exitCode,
+      });
       return;
     }
 

@@ -41,6 +41,14 @@ export interface ScheduleRetryInput {
   stderr: string | null;
 }
 
+/** Snapshot of a job reclaimed after lease expiry (pre-reset ownership). */
+export interface RecoveredLease {
+  jobId: string;
+  previousWorkerId: string | null;
+  previousLeaseUntil: string | null;
+  recoveredAt: string;
+}
+
 export class JobRepository {
   constructor(private readonly db: SqliteDatabase) {}
 
@@ -262,28 +270,53 @@ export class JobRepository {
       .run(leaseUntil, nowIso(), jobId);
   }
 
-  recoverExpiredLeases(now: string): Job[] {
+  recoverExpiredLeases(now: string): RecoveredLease[] {
     const recover = this.db.transaction(() => {
-      const rows = this.db
+      // Capture ownership before reset — RETURNING would only show cleared fields.
+      const stale = this.db
         .prepare(
-          `UPDATE jobs
-           SET state = 'pending',
-               worker_id = NULL,
-               lease_until = NULL,
-               started_at = NULL,
-               updated_at = ?,
-               available_at = ?
+          `SELECT id, worker_id, lease_until FROM jobs
            WHERE state = 'processing'
              AND lease_until IS NOT NULL
-             AND lease_until < ?
-           RETURNING *`,
+             AND lease_until < ?`,
         )
-        .all(now, now, now) as JobRow[];
+        .all(now) as Array<{
+        id: string;
+        worker_id: string | null;
+        lease_until: string | null;
+      }>;
 
-      for (const row of rows) {
-        this.appendHistory(row.id, "recovered", `expired_lease_before=${now}`);
+      if (stale.length === 0) {
+        return [] as RecoveredLease[];
       }
-      return rows.map(mapJobRow);
+
+      const reset = this.db.prepare(
+        `UPDATE jobs
+         SET state = 'pending',
+             worker_id = NULL,
+             lease_until = NULL,
+             started_at = NULL,
+             updated_at = ?,
+             available_at = ?
+         WHERE id = ?`,
+      );
+
+      const recovered: RecoveredLease[] = [];
+      for (const row of stale) {
+        reset.run(now, now, row.id);
+        this.appendHistory(
+          row.id,
+          "recovered",
+          `reason=lease_expired; previous_worker=${row.worker_id}; previous_lease_until=${row.lease_until}`,
+        );
+        recovered.push({
+          jobId: row.id,
+          previousWorkerId: row.worker_id,
+          previousLeaseUntil: row.lease_until,
+          recoveredAt: now,
+        });
+      }
+      return recovered;
     });
 
     return recover();

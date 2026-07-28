@@ -16,13 +16,31 @@ export class RecoveryService {
    * Independent of worker row status (leases are the source of truth for jobs).
    */
   recoverExpiredLeases(): number {
-    const recovered = this.jobs.recoverExpiredLeases(nowIso());
-    if (recovered.length > 0) {
-      logger.warn("Recovery Executed", {
+    const recoveredAt = nowIso();
+    const recovered = this.jobs.recoverExpiredLeases(recoveredAt);
+
+    if (recovered.length === 0) {
+      return 0;
+    }
+
+    if (recovered.length > 1) {
+      logger.info("Recovery Executed", {
         count: recovered.length,
-        job_ids: recovered.map((j) => j.id).join(","),
+        job_ids: recovered.map((r) => r.jobId).join(","),
+        reason: "lease_expired",
       });
     }
+
+    for (const entry of recovered) {
+      logger.info("Stale Job Recovered", {
+        job_id: entry.jobId,
+        previous_worker: entry.previousWorkerId ?? "none",
+        previous_lease_until: entry.previousLeaseUntil ?? "none",
+        recovered_at: entry.recoveredAt,
+        reason: "lease_expired",
+      });
+    }
+
     return recovered.length;
   }
 

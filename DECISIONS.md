@@ -65,11 +65,23 @@ Two OS processes cannot claim the same row because SQLite serializes writers on 
 
 ## Crash recovery
 
-Lease fields: `worker_id`, `lease_until`.
+Exact timeline (interview proof path):
 
-- Heartbeat extends `lease_until` while a job is processing
-- `kill -9` cannot run cleanup; recovery scans expired leases each poll
-- Default `lease-timeout-ms=30000` + `poll-interval-ms=1000` ⇒ worst-case recovery < 60s
+1. **Worker claims job** — atomic `BEGIN IMMEDIATE` claim sets `state=processing`, `worker_id`, and `lease_until = now + lease-timeout-ms`.
+2. **Lease written to database** — ownership is durable; heartbeats extend `lease_until` while work runs.
+3. **Worker crashes (`SIGKILL`)** — no graceful `markStopped`; in-flight cleanup never runs.
+4. **Lease expires** — wall clock passes `lease_until` with no heartbeat extension.
+5. **RecoveryService resets job to `pending`** — clears `worker_id` / `lease_until`, logs `Stale Job Recovered` with previous owner + lease.
+6. **Another worker atomically claims it** — same claim path; `attempts` increments; new lease written.
+7. **Job completes** — survivor executes command and marks `completed`.
+
+**Worst-case recovery time:** default `lease-timeout-ms=30000` (30 seconds). With poll recovery each loop, reclaim happens shortly after expiry — **under the assignment's 60-second maximum**.
+
+Observability logs for this path:
+
+- `Job Claimed` — `job_id`, `worker_id`, `pid`, `attempt`, `lease_until`
+- `Stale Job Recovered` — `job_id`, `previous_worker`, `previous_lease_until`, `recovered_at`, `reason=lease_expired`
+- `Job Completed` — `job_id`, `worker_id`, `attempt`, `duration_ms`, `exit_code`
 
 ### Stale worker rows (zombies)
 

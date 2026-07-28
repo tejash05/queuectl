@@ -15,13 +15,18 @@ CLI (src/cli) → Services (src/core) → Repositories → SQLite
 
 ## Lease Recovery
 
-- Claim sets `lease_until = now + lease-timeout-ms`
-- Heartbeat refreshes `lease_until` while job runs
-- If worker dies (`kill -9`), lease expires
-- Recovery sets expired `processing` jobs back to `pending`
-- Separately, workers with stale heartbeats are marked `stopped` so `status` does not show zombies
+Exact timeline:
 
-Default timeout 30s keeps worst-case job recovery under 60 seconds.
+1. Worker claims job (`state=processing`, lease written).
+2. Worker crashes (`SIGKILL`) — no cleanup.
+3. Lease expires (`lease_until < now`).
+4. `RecoveryService` resets job to `pending` and logs `Stale Job Recovered`.
+5. Another worker claims it atomically.
+6. Job completes.
+
+Default `lease-timeout-ms=30000` ⇒ worst-case recovery **~30 seconds** (under the 60s assignment cap).
+
+Separately, workers with stale heartbeats are marked `stopped` so `status` does not show zombies.
 
 ## Retry / DLQ
 
