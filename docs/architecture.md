@@ -100,33 +100,40 @@ flowchart LR
 
 ## 3. Worker Lifecycle
 
+The recovery timer is a sibling of the scheduler loop, not a step inside it. Both live in
+the same worker process; only the scheduler loop blocks on job execution.
+
 ```mermaid
 flowchart TB
-  Start([worker start]) --> Register[Register worker row status=active]
+  Start([worker start]) --> Runner[Start RecoveryRunner timer - process level]
+  Start --> Register[Register worker row status=active]
   Register --> Heartbeat[Start heartbeat timer]
-  Heartbeat --> Recover[RecoveryService.recover]
-  Recover --> Claim{Atomic claim pending job?}
+  Heartbeat --> Claim{Atomic claim pending job?}
+
+  Runner --> RecoverTick[RecoveryService.recover every recovery-interval-ms]
+  RecoverTick --> RecoverTick
 
   Claim -->|no| Idle[Sleep poll-interval-ms]
   Idle --> StopCheck{stopping or SIGINT?}
-  StopCheck -->|no| Recover
+  StopCheck -->|no| Claim
   StopCheck -->|yes| Drain[Finish in-flight if any]
-  Drain --> MarkStopped[Mark worker stopped]
+  Drain --> StopRunner[Stop recovery timer]
+  StopRunner --> MarkStopped[Mark worker stopped]
   MarkStopped --> Exit([Process exit])
 
   Claim -->|yes| Execute[JobExecutor shell spawn]
   Execute --> Success{exit_code == 0?}
 
   Success -->|yes| Complete[state=completed]
-  Complete --> Recover
+  Complete --> Claim
 
   Success -->|no| RetryCheck{attempts <= max_retries?}
   RetryCheck -->|yes| Backoff[delay = base^attempts seconds]
-  Backoff --> PendingDelay[state=pending available_at=now+delay]
-  PendingDelay --> Recover
+  Backoff --> FailedDelay[state=failed available_at=now+delay]
+  FailedDelay --> Claim
 
   RetryCheck -->|no| Dead[state=dead DLQ]
-  Dead --> Recover
+  Dead --> Claim
 ```
 
 ---
@@ -138,33 +145,36 @@ stateDiagram-v2
   [*] --> pending: enqueue
 
   pending --> processing: atomic claim
+  failed --> processing: backoff expired, atomic claim
   processing --> completed: exit_code 0
-  processing --> pending: failure with retries left\navailable_at = now + base^attempts
+  processing --> failed: retries left\navailable_at = now + base^attempts
   processing --> dead: attempts > max_retries
   processing --> pending: lease expired\nRecoveryService reclaim
-  processing --> failed: markFailed terminal path
 
   dead --> pending: dlq retry\nattempts reset to 0
 
   completed --> [*]
-  failed --> [*]
   dead --> [*]
 ```
 
 Notes:
-- Automatic retries park in `pending` with a future `available_at` (not a separate scheduled state).
-- `failed` remains a valid terminal state; the default retry path does not use it as an intermediate.
+- Automatic retries park in `failed` with a future `available_at` — the assignment's "failed, but will be retried" state.
+- Crash recovery resets to `pending` because a SIGKILL is not a command failure.
 
 ---
 
 ## 5. Crash Recovery Sequence
 
+Recovery runs on `RecoveryRunner`'s own timer inside each worker process, not in the
+scheduler's claim/execute loop. That is what lets Worker B reclaim Worker A's job while
+B is itself busy executing a long command.
+
 ```mermaid
 sequenceDiagram
   participant WA as WorkerA
   participant DB as SQLite
-  participant RS as RecoveryService
-  participant WB as WorkerB
+  participant RR as RecoveryRunner (WorkerB timer)
+  participant WB as WorkerB scheduler
 
   WA->>DB: BEGIN IMMEDIATE claim job
   DB-->>WA: state=processing lease_until=now+30s
@@ -173,17 +183,29 @@ sequenceDiagram
   end
   Note over WA: SIGKILL - no cleanup runs
   Note over DB: heartbeats stop lease_until freezes
+  Note over WB: may be busy executing its own long job
   Note over DB: wall clock passes lease_until
-  WB->>RS: poll recoverExpiredLeases
-  RS->>DB: SELECT processing where lease_until < now
-  RS->>DB: UPDATE state=pending clear worker_id lease
-  RS-->>WB: Stale Job Recovered log
-  WB->>DB: BEGIN IMMEDIATE claim job
+  loop Recovery timer every 5s (independent of WB job)
+    RR->>DB: SELECT processing where lease_until < now
+  end
+  RR->>DB: BEGIN IMMEDIATE UPDATE state=pending clear worker_id lease
+  RR-->>RR: Stale Job Recovered log
+  WB->>DB: BEGIN IMMEDIATE claim job (once free)
   DB-->>WB: state=processing new lease
   WB->>WB: JobExecutor.execute
   WB->>DB: state=completed
-  Note over WA,WB: Job never remains stuck forever worst case ~30s
+  Note over WA,WB: detection ~35s at defaults while any worker process is alive
 ```
+
+Detection (`kill` → `state=pending`) is bounded by lease expiry plus one recovery
+interval: 30s + 5s at defaults. Measured end-to-end at defaults: **34.6s**, with the peer
+worker 35s into a 90s job. Re-execution then waits for a free scheduler, so completion is
+later than detection whenever every worker is busy.
+
+The bound holds only while at least one worker **process** is alive. If every worker is
+killed, nothing is running to detect the expired lease; the job stays `processing` until
+an operator runs `queuectl worker start` (which recovers immediately on startup) or
+`queuectl status` (`src/cli/status.ts:27`).
 
 ---
 
@@ -198,7 +220,7 @@ sequenceDiagram
 
   CLI->>DB: UPDATE workers SET status=stopping
   CLI-->>CLI: Stop requested for N worker(s)
-  loop Poll / heartbeat
+  loop Scheduler poll loop (heartbeat does not check this flag)
     S->>DB: SELECT worker status
     DB-->>S: status=stopping
     S->>S: requestShutdown stop_command
@@ -226,12 +248,12 @@ sequenceDiagram
   Note over DB: Write lock acquired by WorkerA
   WB->>DB: BEGIN IMMEDIATE
   Note over WB,DB: WorkerB blocks on write lock
-  WA->>DB: UPDATE jobs SET processing WHERE id = subquery pending LIMIT 1
+  WA->>DB: UPDATE jobs SET processing WHERE id = subquery pending/failed LIMIT 1
   DB-->>WA: RETURNING claimed row
   WA->>DB: COMMIT
   Note over DB: Write lock released
   WB->>DB: write lock granted
-  WB->>DB: UPDATE jobs SET processing WHERE id = subquery pending LIMIT 1
+  WB->>DB: UPDATE jobs SET processing WHERE id = subquery pending/failed LIMIT 1
   DB-->>WB: empty result - that job already processing
   WB->>DB: COMMIT
   Note over WA,WB: Duplicate execution impossible
@@ -245,7 +267,7 @@ UPDATE jobs
 SET state = 'processing', worker_id = ?, lease_until = ?, attempts = attempts + 1
 WHERE id = (
   SELECT id FROM jobs
-  WHERE state = 'pending' AND available_at <= ?
+  WHERE state IN ('pending', 'failed') AND available_at <= ?
   ORDER BY created_at ASC
   LIMIT 1
 )
@@ -265,8 +287,8 @@ flowchart TB
 
   Cmp -->|no| Calc["delay_seconds = backoff_base ^ attempts"]
   Calc --> Avail["available_at = now + delay"]
-  Avail --> Pend[state=pending]
-  Pend --> Wait[Worker skips until available_at]
+  Avail --> Failed[state=failed]
+  Failed --> Wait[Worker skips until available_at]
   Wait --> ClaimAgain[Atomic claim again]
   ClaimAgain --> Exec
 

@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { closeDatabase, openDatabase } from "../database/database.js";
 import { JobExecutor } from "../core/JobExecutor.js";
+import { RecoveryRunner } from "../core/RecoveryRunner.js";
 import { RecoveryService } from "../core/RecoveryService.js";
 import { RetryService } from "../core/RetryService.js";
 import { Scheduler } from "../core/Scheduler.js";
@@ -36,10 +37,16 @@ export function registerWorkerCommand(program: Command): void {
       const retry = new RetryService(jobs, config);
       const executor = new JobExecutor();
 
+      // Process-level recovery timer: one per worker process regardless of
+      // --count, and independent of every scheduler's claim/execute loop.
+      const recoveryRunner = new RecoveryRunner(recovery, config);
+
       const schedulers: Scheduler[] = [];
       let disposeSignals: (() => void) | null = null;
 
       try {
+        recoveryRunner.start();
+
         for (let i = 0; i < count; i += 1) {
           const registered = workerService.register();
           const scheduler = new Scheduler({
@@ -47,7 +54,6 @@ export function registerWorkerCommand(program: Command): void {
             workerService,
             jobs,
             config,
-            recovery,
             retry,
             executor,
           });
@@ -67,6 +73,9 @@ export function registerWorkerCommand(program: Command): void {
         failure(error instanceof Error ? error.message : String(error));
         process.exitCode = EXIT_ERROR;
       } finally {
+        // Must stop before the connection closes: a firing timer would
+        // otherwise query a closed database.
+        recoveryRunner.stop();
         disposeSignals?.();
         closeDatabase(db);
       }

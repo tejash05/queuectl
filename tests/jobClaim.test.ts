@@ -52,6 +52,37 @@ describe("atomic job claiming", () => {
     }
   });
 
+  it("claims a failed job once its backoff has expired", () => {
+    const ctx = createTestContext();
+    try {
+      const worker = ctx.workers.register({ hostname: "test", pid: 1 });
+      ctx.jobs.create({ id: "retryable", command: "false", maxRetries: 3 });
+      const now = nowIso();
+      ctx.jobs.claimNext({
+        workerId: worker.id,
+        leaseUntil: addMs(now, 30_000),
+        now,
+      });
+      ctx.db
+        .prepare(
+          `UPDATE jobs SET state = 'failed', available_at = ?, worker_id = NULL, lease_until = NULL WHERE id = 'retryable'`,
+        )
+        .run(now);
+
+      const claimed = ctx.jobs.claimNext({
+        workerId: worker.id,
+        leaseUntil: addMs(nowIso(), 30_000),
+        now: nowIso(),
+      });
+
+      expect(claimed?.id).toBe("retryable");
+      expect(claimed?.state).toBe("processing");
+      expect(claimed?.attempts).toBe(2);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("skips pending jobs that are not yet available", () => {
     const ctx = createTestContext();
     try {

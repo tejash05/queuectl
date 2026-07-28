@@ -25,9 +25,7 @@ Database path defaults to `./data/queuectl.sqlite`. Override with `QUEUECTL_DB`.
 
 ## Demo recording
 
-> **TODO:** Replace this with your uploaded demo URL (YouTube / Google Drive / Loom).
->
-> Demo link: _<add recording URL before submission>_
+> Demo link: [QueuectlDemo.mov](https://drive.google.com/file/d/1odrKU852VPRJ4wwHndpkHI0OAORquIyB/view?usp=sharing)
 >
 > Suggested demo script: enqueue → `worker start --count 2` → `status` / `list --json` → Ctrl+C drain → `kill -9` recovery (`Stale Job Recovered` log) → `dlq` / `config set`.
 
@@ -59,12 +57,12 @@ queuectl config get
 ## Features
 
 - JSON enqueue with client-provided job IDs
-- Concurrent workers via `--count`
+- Concurrent workers via `--count` (same OS process) or separate `worker start` terminals (separate OS processes)
 - Atomic job claiming (`BEGIN IMMEDIATE`)
 - SQLite persistence (WAL mode)
 - Exponential backoff: `delay_seconds = backoff-base ^ attempts`
 - Dead letter queue + operator retry
-- Lease-based crash recovery (< 60s worst case with defaults)
+- Lease-based crash recovery on an independent timer (~35s at defaults, measured 34.6s)
 - Worker heartbeats + lease extension
 - Graceful SIGINT/SIGTERM shutdown
 - Cooperative `worker stop` from another terminal
@@ -205,23 +203,27 @@ Append-only audit events.
 
 ## Worker Lifecycle
 
+The recovery timer is a sibling of the scheduler loop, not a step inside it.
+
 ```mermaid
 flowchart TB
-  Start([worker start]) --> Reg[Register active]
+  Start([worker start]) --> Runner[Start RecoveryRunner timer]
+  Start --> Reg[Register active]
   Reg --> HB[Heartbeat loop]
-  HB --> Rec[Recover expired leases]
-  Rec --> Claim{Claim pending job?}
+  HB --> Claim{Claim pending or due failed job?}
   Claim -->|no| Idle[Sleep]
-  Idle --> Rec
+  Idle --> Claim
   Claim -->|yes| Run[Execute command]
   Run --> Ok{Success?}
   Ok -->|yes| Done[completed]
-  Done --> Rec
+  Done --> Claim
   Ok -->|no| Retry{Retries left?}
-  Retry -->|yes| Backoff["pending + base^attempts"]
-  Backoff --> Rec
+  Retry -->|yes| Backoff["failed + base^attempts"]
+  Backoff --> Claim
   Retry -->|no| Dead[dead DLQ]
-  Dead --> Rec
+  Dead --> Claim
+  Runner --> Rec[recoverExpiredLeases every 5s]
+  Rec --> Rec
 ```
 
 ## Job State Machine
@@ -230,8 +232,9 @@ flowchart TB
 stateDiagram-v2
   [*] --> pending: enqueue
   pending --> processing: atomic claim
+  failed --> processing: backoff expired, atomic claim
   processing --> completed: success
-  processing --> pending: retry with backoff
+  processing --> failed: retryable failure + backoff
   processing --> pending: lease recovery after SIGKILL
   processing --> dead: max retries exceeded
   dead --> pending: dlq retry
@@ -245,8 +248,8 @@ stateDiagram-v2
 flowchart TB
   Fail[Command failed] --> Check{attempts > max_retries?}
   Check -->|no| Delay["available_at = now + base^attempts"]
-  Delay --> Pending[state=pending]
-  Pending --> Later[Claim again when due]
+  Delay --> Failed[state=failed]
+  Failed --> Later[Claim again when due]
   Check -->|yes| DLQ[state=dead]
   DLQ --> Manual[dlq retry resets attempts]
 ```
@@ -261,21 +264,38 @@ Existing jobs keep their snapshotted `max_retries`. New `config set max-retries`
 sequenceDiagram
   participant WA as WorkerA
   participant DB as SQLite
-  participant RS as RecoveryService
-  participant WB as WorkerB
+  participant RR as RecoveryRunner (WorkerB timer)
+  participant WB as WorkerB scheduler
 
   WA->>DB: claim + lease_until
   Note over WA: SIGKILL
-  Note over DB: lease expires ~30s
-  WB->>RS: recoverExpiredLeases
-  RS->>DB: processing to pending
-  WB->>DB: claim again
+  Note over DB: lease expires after ~30s
+  Note over WB: may be busy with its own long job
+  RR->>DB: recoverExpiredLeases (every 5s, independent of WB job)
+  RR->>DB: processing to pending
+  WB->>DB: claim again (once free)
   WB->>DB: completed
 ```
 
 Look for stderr: `Job Claimed` → `Stale Job Recovered` → `Job Claimed` → `Job Completed`.
 
-Default worst case: **~30 seconds** (`lease-timeout-ms=30000`), under the 60s assignment maximum.
+Recovery runs on `RecoveryRunner`'s own timer (`src/core/RecoveryRunner.ts`), one per worker
+process, **not** inside the scheduler's claim/execute loop. That is what lets a worker
+reclaim a crashed peer's job while it is itself executing a long-running command.
+
+**Detection time** (SIGKILL → job back in `pending`) is bounded by lease expiry plus one
+recovery interval: `lease-timeout-ms` (30s) + `recovery-interval-ms` (5s) ≈ **35s** at
+defaults, inside the assignment's 60s limit. Measured end-to-end at defaults: **34.6s**,
+with the surviving worker 35s into a 90s job.
+
+This bound holds **while at least one worker process is alive**. If every worker is killed
+there is no process left to detect the expired lease; the job is recovered as soon as an
+operator runs `queuectl worker start` (which recovers immediately on startup) or
+`queuectl status`. Re-execution is additionally gated on a free worker, so a job may sit in
+`pending` after recovery until some scheduler finishes its current work.
+
+Covered by `tests/crashRecoveryWhilePeerBusy.test.ts` (real processes, real `SIGKILL`,
+reports the measured recovery time) and `tests/recoveryRunner.test.ts`.
 
 ## Worker Stop
 
@@ -301,7 +321,7 @@ sequenceDiagram
 
   A->>DB: BEGIN IMMEDIATE
   B-->>DB: waits for write lock
-  A->>DB: UPDATE pending to processing RETURNING
+  A->>DB: UPDATE pending/failed to processing RETURNING
   A->>DB: COMMIT
   B->>DB: BEGIN IMMEDIATE
   B->>DB: no row left to claim
@@ -313,9 +333,11 @@ sequenceDiagram
 |---|---|---|
 | `max-retries` | `3` | Retry budget snapshotted onto each job at enqueue |
 | `backoff-base` | `2` | Seconds delay = `base ^ attempts` |
-| `lease-timeout-ms` | `30000` | Job lease / crash recovery window (~30s worst case) |
+| `lease-timeout-ms` | `30000` | Job lease; a lease this stale means the owner died |
 | `heartbeat-interval-ms` | `5000` | Worker + lease heartbeat cadence |
+| `recovery-interval-ms` | `5000` | Independent recovery timer; detection ≈ lease + this |
 | `poll-interval-ms` | `1000` | Idle poll sleep |
+| `output-truncate-bytes` | `8192` | Captured stdout/stderr cap per job |
 
 ```bash
 queuectl config set max-retries 3
@@ -330,6 +352,10 @@ npm test
 npm run typecheck
 ```
 
+`npm test` includes black-box CLI tests that spawn real `queuectl worker start` processes
+and send `SIGKILL`. Those tests need permission to manage process groups (they fail under
+a tight sandbox with a timeout waiting for a worker to claim a job).
+
 ## Assumptions
 
 - Single-machine deployment sharing one SQLite file (not a multi-region cluster).
@@ -341,9 +367,16 @@ npm run typecheck
 ## Limitations
 
 - SQLite write lock limits multi-worker throughput (by design for this assignment).
-- Crash recovery is **at-least-once**: a job may run again after SIGKILL.
+- Crash recovery is **at-least-once**: a job may run again after SIGKILL. Commands should be
+  idempotent — a killed worker's child process is not itself reaped by QueueCTL, so work
+  already performed before the crash is not undone. A bare `kill -9 <pid>` orphans the
+  shell child; `kill -- -<pgid>` reaps the group.
+- Recovery requires a live worker process. With every worker dead, detection waits for the
+  next `worker start` or `status`; there is no standalone recovery daemon by design.
 - `worker stop` is cooperative (DB flag), not instant remote kill.
-- Automatic retries use `pending` + `available_at` rather than parking in `failed` (see DECISIONS.md).
+- Automatic retries park in `failed` with a future `available_at` (the assignment's
+  "failed, but will be retried" state). Crash recovery resets to `pending`, not `failed`,
+  because a SIGKILL is not a command failure.
 - Not a distributed queue; Redis/NATS would be needed for multi-host workers.
 - No web dashboard in this submission.
 

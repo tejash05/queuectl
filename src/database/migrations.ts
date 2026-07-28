@@ -16,8 +16,10 @@ const LEGACY_CONFIG_KEY_MAP: Record<string, string> = {
   heartbeat_interval_ms: "heartbeat-interval-ms",
   poll_interval_ms: "poll-interval-ms",
   output_truncate_bytes: "output-truncate-bytes",
-  shutdown_grace_ms: "shutdown-grace-ms",
 };
+
+/** Keys that were seeded by earlier versions and are no longer read anywhere. */
+const RETIRED_CONFIG_KEYS = ["shutdown-grace-ms", "shutdown_grace_ms"];
 
 function seedConfig(db: Database.Database): void {
   const insert = db.prepare(
@@ -188,6 +190,27 @@ const migrations: Migration[] = [
         CREATE INDEX IF NOT EXISTS idx_jobs_lease_until ON jobs (lease_until);
       `);
       db.exec(`PRAGMA foreign_keys = ON`);
+    },
+  },
+  {
+    id: 3,
+    name: "003_seed_recovery_interval",
+    up(db) {
+      // seedConfig is INSERT OR IGNORE, so this only backfills keys added after
+      // an existing database was created (recovery-interval-ms).
+      seedConfig(db);
+    },
+  },
+  {
+    id: 4,
+    name: "004_drop_retired_config_keys",
+    up(db) {
+      // A settable key that nothing reads is worse than no key at all, so it is
+      // dropped from existing databases rather than left visible in config get.
+      const del = db.prepare(`DELETE FROM config WHERE key = ?`);
+      for (const key of RETIRED_CONFIG_KEYS) {
+        del.run(key);
+      }
     },
   },
 ];

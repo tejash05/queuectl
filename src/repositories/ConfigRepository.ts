@@ -2,7 +2,9 @@ import type { SqliteDatabase } from "../database/database.js";
 import { mapConfigRow, type ConfigEntry, type ConfigRow } from "../models/Config.js";
 import {
   CONFIG_KEYS,
+  CONFIG_RULES,
   DEFAULT_CONFIG,
+  MIN_LEASE_TO_HEARTBEAT_RATIO,
   type ConfigKey,
 } from "../utils/constants.js";
 import { nowIso } from "../utils/time.js";
@@ -23,7 +25,11 @@ export class ConfigRepository {
     if (!row) {
       return DEFAULT_CONFIG[key];
     }
-    return Number(row.value);
+
+    // Values written before validation existed (or edited in the file directly)
+    // must not propagate NaN into lease/backoff arithmetic.
+    const parsed = Number(row.value);
+    return Number.isFinite(parsed) ? parsed : DEFAULT_CONFIG[key];
   }
 
   getMany(keys: ConfigKey[]): Record<ConfigKey, number> {
@@ -38,9 +44,9 @@ export class ConfigRepository {
     if (!CONFIG_KEYS.includes(key)) {
       throw new Error(`Unknown config key: ${key}`);
     }
-    if (!Number.isFinite(value) || value < 0) {
-      throw new Error(`Config value must be a non-negative number: ${value}`);
-    }
+
+    validateConfigValue(key, value);
+    this.validateAgainstRelatedKeys(key, value);
 
     const updatedAt = nowIso();
     this.db
@@ -51,6 +57,44 @@ export class ConfigRepository {
       .run(key, String(value), updatedAt);
 
     return { key, value, updatedAt };
+  }
+
+  /**
+   * lease-timeout-ms and heartbeat-interval-ms are only safe as a pair: if a
+   * lease can expire before the next heartbeat renews it, recovery reclaims
+   * jobs that are still running and they execute twice.
+   */
+  private validateAgainstRelatedKeys(key: ConfigKey, value: number): void {
+    if (key !== "lease-timeout-ms" && key !== "heartbeat-interval-ms") {
+      return;
+    }
+
+    const lease = key === "lease-timeout-ms" ? value : this.get("lease-timeout-ms");
+    const heartbeat =
+      key === "heartbeat-interval-ms" ? value : this.get("heartbeat-interval-ms");
+
+    if (lease < heartbeat * MIN_LEASE_TO_HEARTBEAT_RATIO) {
+      throw new Error(
+        `lease-timeout-ms (${lease}) must be at least ${MIN_LEASE_TO_HEARTBEAT_RATIO}x ` +
+          `heartbeat-interval-ms (${heartbeat}); adjust the other key first`,
+      );
+    }
+  }
+}
+
+export function validateConfigValue(key: ConfigKey, value: number): void {
+  const rule = CONFIG_RULES[key];
+
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${key} must be a finite number (got: ${String(value)})`);
+  }
+  if (rule.integer && !Number.isInteger(value)) {
+    throw new Error(`${key} must be an integer (got: ${value}) — ${rule.hint}`);
+  }
+  if (value < rule.min || value > rule.max) {
+    throw new Error(
+      `${key} must be between ${rule.min} and ${rule.max} (got: ${value}) — ${rule.hint}`,
+    );
   }
 }
 

@@ -13,6 +13,13 @@ export interface HandleFailureInput {
   stderr: string | null;
 }
 
+/**
+ * Decides what a failed execution becomes.
+ *
+ * Retry budget left  → 'failed' with available_at = now + base^attempts seconds
+ *                      (the assignment's "failed, but will be retried" state).
+ * Budget exhausted   → 'dead' (dead letter queue, terminal until dlq retry).
+ */
 export class RetryService {
   constructor(
     private readonly jobs: JobRepository,
@@ -53,9 +60,11 @@ export class RetryService {
       stderr,
     });
 
-    logger.warn("Retry Scheduled", {
+    logger.warn("Job Failed - Retry Scheduled", {
       job_id: job.id,
+      state: "failed",
       attempt: job.attempts,
+      max_retries: job.maxRetries,
       delay_seconds: delayMs / 1000,
       available_at: availableAt,
       error,

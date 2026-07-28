@@ -20,13 +20,18 @@ export interface Job {
   finishedAt: string | null;
 }
 
-/** Public JSON contract for list --json and similar. */
+/**
+ * Public JSON contract for list --json and similar.
+ * These seven fields are required by the assignment; keys stay snake_case.
+ */
 export interface JobJson {
   id: string;
   command: string;
   state: JobState;
   attempts: number;
   max_retries: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface JobRow {
@@ -78,6 +83,8 @@ export function toJobJson(job: Job): JobJson {
     state: job.state,
     attempts: job.attempts,
     max_retries: job.maxRetries,
+    created_at: job.createdAt,
+    updated_at: job.updatedAt,
   };
 }
 

@@ -119,7 +119,12 @@ export class JobRepository {
   }
 
   /**
-   * Atomically claim the oldest available pending job.
+   * Atomically claim the oldest runnable job.
+   *
+   * Runnable means 'pending' (never attempted, or reset by crash recovery) or
+   * 'failed' (attempted, retryable, waiting out its backoff). Both are gated by
+   * available_at, so a failed job stays invisible until its backoff expires.
+   *
    * Uses BEGIN IMMEDIATE so concurrent writers serialize on the write lock.
    */
   claimNext(input: ClaimJobInput): Job | null {
@@ -140,7 +145,7 @@ export class JobRepository {
                finished_at = NULL
            WHERE id = (
              SELECT id FROM jobs
-             WHERE state = 'pending'
+             WHERE state IN ('pending', 'failed')
                AND available_at <= ?
              ORDER BY created_at ASC
              LIMIT 1
@@ -181,35 +186,6 @@ export class JobRepository {
     return this.getById(input.jobId)!;
   }
 
-  markFailed(input: FailJobInput): Job {
-    const ts = nowIso();
-    this.db
-      .prepare(
-        `UPDATE jobs
-         SET state = 'failed',
-             last_error = ?,
-             exit_code = ?,
-             stdout = ?,
-             stderr = ?,
-             lease_until = NULL,
-             updated_at = ?,
-             finished_at = ?
-         WHERE id = ?`,
-      )
-      .run(
-        input.error,
-        input.exitCode,
-        input.stdout,
-        input.stderr,
-        ts,
-        ts,
-        input.jobId,
-      );
-
-    this.appendHistory(input.jobId, "failed", input.error);
-    return this.getById(input.jobId)!;
-  }
-
   markDead(input: FailJobInput): Job {
     const ts = nowIso();
     this.db
@@ -239,13 +215,21 @@ export class JobRepository {
     return this.getById(input.jobId)!;
   }
 
-  /** Return job to pending with a future available_at (delayed retry). */
+  /**
+   * Record a retryable failure: state 'failed' with a future available_at.
+   *
+   * 'failed' is the assignment's "failed, but will be retried" state, so the
+   * error context (last_error/exit_code/stdout/stderr) is deliberately kept for
+   * `list --state failed` inspection. Ownership is released because no worker
+   * holds the job during backoff; claimNext picks it up again once available_at
+   * passes.
+   */
   scheduleRetry(input: ScheduleRetryInput): Job {
     const ts = nowIso();
     this.db
       .prepare(
         `UPDATE jobs
-         SET state = 'pending',
+         SET state = 'failed',
              available_at = ?,
              last_error = ?,
              exit_code = ?,
@@ -254,7 +238,7 @@ export class JobRepository {
              worker_id = NULL,
              lease_until = NULL,
              started_at = NULL,
-             finished_at = NULL,
+             finished_at = ?,
              updated_at = ?
          WHERE id = ?`,
       )
@@ -265,12 +249,13 @@ export class JobRepository {
         input.stdout,
         input.stderr,
         ts,
+        ts,
         input.jobId,
       );
 
     this.appendHistory(
       input.jobId,
-      "retry_scheduled",
+      "failed",
       `available_at=${input.availableAt}; error=${input.error}`,
     );
     return this.getById(input.jobId)!;
@@ -284,7 +269,31 @@ export class JobRepository {
       .run(leaseUntil, nowIso(), jobId);
   }
 
+  /**
+   * Reclaim jobs whose lease expired (worker died without cleanup).
+   *
+   * Called on a timer by every worker process, so the common case — nothing to
+   * recover — is a lock-free indexed read. Only when stale rows exist do we open
+   * a write transaction, and that transaction is IMMEDIATE so it takes SQLite's
+   * write lock before re-reading. Two processes recovering at once therefore
+   * serialize, and the loser's re-read sees the rows already back in 'pending'
+   * and recovers nothing — no duplicate reset, no duplicate history row.
+   */
   recoverExpiredLeases(now: string): RecoveredLease[] {
+    const hasStale = this.db
+      .prepare(
+        `SELECT 1 FROM jobs
+         WHERE state = 'processing'
+           AND lease_until IS NOT NULL
+           AND lease_until < ?
+         LIMIT 1`,
+      )
+      .get(now);
+
+    if (!hasStale) {
+      return [];
+    }
+
     const recover = this.db.transaction(() => {
       // Capture ownership before reset — RETURNING would only show cleared fields.
       const stale = this.db
@@ -333,7 +342,7 @@ export class JobRepository {
       return recovered;
     });
 
-    return recover();
+    return recover.immediate();
   }
 
   listDead(limit?: number): Job[] {

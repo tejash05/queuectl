@@ -32,10 +32,15 @@ export class JobExecutor {
     logger.debug("Executing job", { job_id: job.id, command });
 
     return new Promise((resolve) => {
+      // Own process group: SIGINT/SIGTERM to the worker (Ctrl+C, kill -- -$pgid)
+      // must not kill the in-flight command. The worker still awaits `close`
+      // (child is not unref'd). SIGKILL of the worker PID orphans the child —
+      // crash recovery is therefore at-least-once.
       const child = spawn(command, {
         cwd: job.cwd ?? process.cwd(),
         env: process.env,
         shell: true,
+        detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
 

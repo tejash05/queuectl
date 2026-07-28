@@ -4,7 +4,6 @@ import { JobRepository } from "../repositories/JobRepository.js";
 import { addMs, nowIso, sleep } from "../utils/time.js";
 import { logger } from "../utils/logger.js";
 import type { WorkerService } from "./WorkerService.js";
-import type { RecoveryService } from "./RecoveryService.js";
 import type { RetryService } from "./RetryService.js";
 import type { JobExecutor, ExecutionResult } from "./JobExecutor.js";
 
@@ -13,14 +12,17 @@ export interface SchedulerDeps {
   workerService: WorkerService;
   jobs: JobRepository;
   config: ConfigRepository;
-  recovery: RecoveryService;
   retry: RetryService;
   executor: JobExecutor;
 }
 
 /**
- * Poll loop: recovery → heartbeat → claim → execute → retry/complete.
+ * Poll loop: stop check → heartbeat → claim → execute → retry/complete.
  * Graceful shutdown stops new claims and waits for the in-flight job.
+ *
+ * Lease recovery deliberately does not live here. This loop blocks on
+ * executeAndSettle() for the whole duration of a job, so recovery driven from
+ * here would stall while the worker is busy. RecoveryRunner owns it on a timer.
  */
 export class Scheduler {
   private stopping = false;
@@ -57,7 +59,6 @@ export class Scheduler {
           break;
         }
 
-        this.deps.recovery.recover();
         this.tickHeartbeat();
 
         const leaseTimeout = config.get("lease-timeout-ms");

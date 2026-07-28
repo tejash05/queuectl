@@ -18,7 +18,31 @@ describe("enqueue JSON contract", () => {
         state: "pending",
         attempts: 0,
         max_retries: 3,
+        created_at: job.createdAt,
+        updated_at: job.updatedAt,
       });
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("exposes all seven required fields with ISO timestamps", () => {
+    const ctx = createTestContext();
+    try {
+      const service = new JobService(ctx.jobs, ctx.config);
+      const json = toJobJson(service.enqueueFromJson('{"command":"echo hi"}'));
+
+      expect(Object.keys(json).sort()).toEqual([
+        "attempts",
+        "command",
+        "created_at",
+        "id",
+        "max_retries",
+        "state",
+        "updated_at",
+      ]);
+      expect(Number.isNaN(Date.parse(json.created_at))).toBe(false);
+      expect(Number.isNaN(Date.parse(json.updated_at))).toBe(false);
     } finally {
       ctx.cleanup();
     }
