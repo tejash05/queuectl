@@ -25,9 +25,7 @@ Database path defaults to `./data/queuectl.sqlite`. Override with `QUEUECTL_DB`.
 
 ## Demo recording
 
-> **TODO:** Replace this with your uploaded demo URL (YouTube / Google Drive / Loom).
->
-> Demo link: _<add recording URL before submission>_
+> Demo link: [QueuectlDemo.mov](https://drive.google.com/file/d/1odrKU852VPRJ4wwHndpkHI0OAORquIyB/view?usp=sharing)
 >
 > Suggested demo script: enqueue → `worker start --count 2` → `status` / `list --json` → Ctrl+C drain → `kill -9` recovery (`Stale Job Recovered` log) → `dlq` / `config set`.
 
