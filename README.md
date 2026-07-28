@@ -72,23 +72,112 @@ queuectl config get
 
 ## Architecture
 
-```text
-┌─────────────────────────────────────────────────────────┐
-│ CLI: enqueue | worker | status | list | config | dlq    │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────┐
-│ Services: Job / Worker / Retry / Recovery / Scheduler   │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-┌───────────────────────────▼─────────────────────────────┐
-│ Repositories → SQLite (WAL) jobs | workers | config     │
-└─────────────────────────────────────────────────────────┘
+Layered clean architecture. Deep-dive diagrams (crash recovery sequence, atomic claim contention, full ER, folder map) live in [docs/architecture.md](./docs/architecture.md).
+
+```mermaid
+flowchart TB
+  subgraph cliLayer [CLI Layer]
+    direction LR
+    EnqueueCmd[enqueue]
+    WorkerCmd[worker]
+    StatusCmd[status]
+    ListCmd[list]
+    DlqCmd[dlq]
+    ConfigCmd[config]
+  end
+
+  subgraph appLayer [Application Layer]
+    JobService[JobService]
+    WorkerService[WorkerService]
+    RetryService[RetryService]
+    RecoveryService[RecoveryService]
+    Scheduler[Scheduler]
+    JobExecutor[JobExecutor]
+  end
+
+  subgraph repoLayer [Repository Layer]
+    JobRepo[JobRepository]
+    WorkerRepo[WorkerRepository]
+    ConfigRepo[ConfigRepository]
+  end
+
+  subgraph dbLayer [SQLite WAL]
+    JobsTable[(jobs)]
+    WorkersTable[(workers)]
+    ConfigTable[(config)]
+  end
+
+  EnqueueCmd --> JobService
+  WorkerCmd --> Scheduler
+  WorkerCmd --> WorkerService
+  StatusCmd --> JobService
+  StatusCmd --> WorkerService
+  ListCmd --> JobService
+  DlqCmd --> JobService
+  ConfigCmd --> ConfigRepo
+
+  JobService --> JobRepo
+  WorkerService --> WorkerRepo
+  RetryService --> JobRepo
+  RecoveryService --> JobRepo
+  Scheduler --> RecoveryService
+  Scheduler --> JobRepo
+  Scheduler --> JobExecutor
+  Scheduler --> RetryService
+
+  JobRepo --> JobsTable
+  WorkerRepo --> WorkersTable
+  ConfigRepo --> ConfigTable
 ```
 
-See [docs/architecture.md](./docs/architecture.md) and [DECISIONS.md](./DECISIONS.md).
+### Request flow
+
+```mermaid
+flowchart LR
+  Op([Operator]) -->|enqueue JSON| CLI[CLI]
+  CLI --> JS[JobService]
+  JS --> JR[JobRepository]
+  JR -->|INSERT pending| DB[(SQLite)]
+  W([Worker]) -->|claim BEGIN IMMEDIATE| DB
+  W -->|execute| EX[JobExecutor]
+  EX -->|complete or retry/DLQ| DB
+  Op2([Operator]) -->|status list --json| CLI2[CLI reads]
+  CLI2 --> DB
+```
+
+See [DECISIONS.md](./DECISIONS.md) for claim, lease recovery, and stop-design rationale.
 
 ## Database Schema
+
+```mermaid
+erDiagram
+  WORKERS ||--o{ JOBS : claims
+  JOBS ||--o{ JOB_HISTORY : audits
+
+  JOBS {
+    text id PK
+    text command
+    text state
+    int attempts
+    int max_retries
+    text available_at
+    text worker_id FK
+    text lease_until
+  }
+
+  WORKERS {
+    text id PK
+    text hostname
+    int pid
+    text status
+    text last_heartbeat_at
+  }
+
+  CONFIG {
+    text key PK
+    text value
+  }
+```
 
 ### `jobs`
 
@@ -116,21 +205,50 @@ Append-only audit events.
 
 ## Worker Lifecycle
 
-```text
-start [--count N] → register N workers → heartbeat loops
-                 → recover expired leases
-                 → claim job (atomic) → state=processing
-                 → execute shell command
-                 → completed | pending(delayed) | dead
-SIGINT / worker stop → finish current job → mark stopped
+```mermaid
+flowchart TB
+  Start([worker start]) --> Reg[Register active]
+  Reg --> HB[Heartbeat loop]
+  HB --> Rec[Recover expired leases]
+  Rec --> Claim{Claim pending job?}
+  Claim -->|no| Idle[Sleep]
+  Idle --> Rec
+  Claim -->|yes| Run[Execute command]
+  Run --> Ok{Success?}
+  Ok -->|yes| Done[completed]
+  Done --> Rec
+  Ok -->|no| Retry{Retries left?}
+  Retry -->|yes| Backoff["pending + base^attempts"]
+  Backoff --> Rec
+  Retry -->|no| Dead[dead DLQ]
+  Dead --> Rec
+```
+
+## Job State Machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending: enqueue
+  pending --> processing: atomic claim
+  processing --> completed: success
+  processing --> pending: retry with backoff
+  processing --> pending: lease recovery after SIGKILL
+  processing --> dead: max retries exceeded
+  dead --> pending: dlq retry
+  completed --> [*]
+  dead --> [*]
 ```
 
 ## Retry Flow
 
-```text
-failure (attempts already incremented at claim)
-  ├─ attempts <= max_retries → state=pending, available_at=now+base^attempts seconds
-  └─ attempts >  max_retries → state=dead (DLQ)
+```mermaid
+flowchart TB
+  Fail[Command failed] --> Check{attempts > max_retries?}
+  Check -->|no| Delay["available_at = now + base^attempts"]
+  Delay --> Pending[state=pending]
+  Pending --> Later[Claim again when due]
+  Check -->|yes| DLQ[state=dead]
+  DLQ --> Manual[dlq retry resets attempts]
 ```
 
 Example with `backoff-base=2`: attempt 1 → 2s, attempt 2 → 4s, attempt 3 → 8s.
@@ -139,13 +257,55 @@ Existing jobs keep their snapshotted `max_retries`. New `config set max-retries`
 
 ## Crash Recovery
 
-1. Worker claims job → `state=processing`, lease written (`lease_until`)
-2. Worker crashes (`kill -9`) → no cleanup
-3. Lease expires (default `lease-timeout-ms=30000` ≈ **30s**, under 60s max)
-4. `RecoveryService` resets job to `pending` and logs `Stale Job Recovered`
-5. Another worker claims it → executes → `completed`
+```mermaid
+sequenceDiagram
+  participant WA as WorkerA
+  participant DB as SQLite
+  participant RS as RecoveryService
+  participant WB as WorkerB
 
-Look for these stderr logs in a live demo: `Job Claimed` → `Stale Job Recovered` → `Job Claimed` (new worker) → `Job Completed`.
+  WA->>DB: claim + lease_until
+  Note over WA: SIGKILL
+  Note over DB: lease expires ~30s
+  WB->>RS: recoverExpiredLeases
+  RS->>DB: processing to pending
+  WB->>DB: claim again
+  WB->>DB: completed
+```
+
+Look for stderr: `Job Claimed` → `Stale Job Recovered` → `Job Claimed` → `Job Completed`.
+
+Default worst case: **~30 seconds** (`lease-timeout-ms=30000`), under the 60s assignment maximum.
+
+## Worker Stop
+
+```mermaid
+sequenceDiagram
+  participant CLI as queuectl worker stop
+  participant DB as SQLite
+  participant S as Scheduler
+
+  CLI->>DB: status=stopping
+  S->>DB: observe stopping
+  S->>S: finish current job
+  S->>DB: status=stopped
+```
+
+## Atomic Claim
+
+```mermaid
+sequenceDiagram
+  participant A as WorkerA
+  participant DB as SQLite
+  participant B as WorkerB
+
+  A->>DB: BEGIN IMMEDIATE
+  B-->>DB: waits for write lock
+  A->>DB: UPDATE pending to processing RETURNING
+  A->>DB: COMMIT
+  B->>DB: BEGIN IMMEDIATE
+  B->>DB: no row left to claim
+```
 
 ## Configuration
 
@@ -188,6 +348,26 @@ npm run typecheck
 - No web dashboard in this submission.
 
 ## Project Structure
+
+```mermaid
+flowchart TB
+  subgraph repo [queuectl]
+    README[README.md]
+    DECISIONS[DECISIONS.md]
+    subgraph src [src]
+      cli[cli]
+      core[core services]
+      repositories[repositories]
+      database[database]
+      models[models]
+      utils[utils]
+      index[index.ts]
+    end
+    tests[tests]
+    docs[docs]
+    data[data]
+  end
+```
 
 ```text
 src/
