@@ -13,13 +13,16 @@ export function registerListCommand(program: Command): void {
     .description("List jobs")
     .option("--state <state>", "Filter by state")
     .option("--json", "Print only a JSON array to stdout")
-    .option("--limit <n>", "Maximum rows", "50")
-    .action((options: { state?: string; json?: boolean; limit: string }) => {
-      const limit = Number(options.limit);
-      if (!Number.isInteger(limit) || limit <= 0) {
-        failure("--limit must be a positive integer");
-        process.exitCode = EXIT_USAGE;
-        return;
+    .option("--limit <n>", "Optional maximum rows (default: all matching jobs)")
+    .action((options: { state?: string; json?: boolean; limit?: string }) => {
+      let limit: number | undefined;
+      if (options.limit !== undefined) {
+        limit = Number(options.limit);
+        if (!Number.isInteger(limit) || limit <= 0) {
+          failure("--limit must be a positive integer");
+          process.exitCode = EXIT_USAGE;
+          return;
+        }
       }
 
       if (options.state && !isJobState(options.state)) {
@@ -33,7 +36,7 @@ export function registerListCommand(program: Command): void {
         const service = new JobService(new JobRepository(db), new ConfigRepository(db));
         const filter = {
           ...(options.state && isJobState(options.state) ? { state: options.state } : {}),
-          limit,
+          ...(limit !== undefined ? { limit } : {}),
         };
 
         if (options.json) {

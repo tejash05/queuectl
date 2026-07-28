@@ -67,11 +67,11 @@ export class JobService {
     return this.jobs.getById(id);
   }
 
-  list(options: { state?: JobState; limit: number }): Job[] {
+  list(options: { state?: JobState; limit?: number } = {}): Job[] {
     return this.jobs.list(options);
   }
 
-  listJson(options: { state?: JobState; limit: number }): JobJson[] {
+  listJson(options: { state?: JobState; limit?: number } = {}): JobJson[] {
     return this.list(options).map(toJobJson);
   }
 
@@ -79,7 +79,7 @@ export class JobService {
     return this.jobs.countByState();
   }
 
-  listDead(limit: number): Job[] {
+  listDead(limit?: number): Job[] {
     return this.jobs.listDead(limit);
   }
 

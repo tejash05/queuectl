@@ -78,17 +78,31 @@ export class JobRepository {
     return row ? mapJobRow(row) : null;
   }
 
-  list(options: { state?: JobState; limit: number }): Job[] {
-    if (options.state) {
+  list(options: { state?: JobState; limit?: number } = {}): Job[] {
+    if (options.state && options.limit !== undefined) {
       const rows = this.db
         .prepare(`SELECT * FROM jobs WHERE state = ? ORDER BY created_at DESC LIMIT ?`)
         .all(options.state, options.limit) as JobRow[];
       return rows.map(mapJobRow);
     }
 
+    if (options.state) {
+      const rows = this.db
+        .prepare(`SELECT * FROM jobs WHERE state = ? ORDER BY created_at DESC`)
+        .all(options.state) as JobRow[];
+      return rows.map(mapJobRow);
+    }
+
+    if (options.limit !== undefined) {
+      const rows = this.db
+        .prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?`)
+        .all(options.limit) as JobRow[];
+      return rows.map(mapJobRow);
+    }
+
     const rows = this.db
-      .prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?`)
-      .all(options.limit) as JobRow[];
+      .prepare(`SELECT * FROM jobs ORDER BY created_at DESC`)
+      .all() as JobRow[];
     return rows.map(mapJobRow);
   }
 
@@ -322,8 +336,8 @@ export class JobRepository {
     return recover();
   }
 
-  listDead(limit: number): Job[] {
-    return this.list({ state: "dead", limit });
+  listDead(limit?: number): Job[] {
+    return this.list({ state: "dead", ...(limit !== undefined ? { limit } : {}) });
   }
 
   requeueDead(jobId: string): Job | null {
@@ -357,7 +371,7 @@ export class JobRepository {
   }
 
   requeueAllDead(): number {
-    const dead = this.listDead(10_000);
+    const dead = this.listDead();
     let count = 0;
     const tx = this.db.transaction(() => {
       for (const job of dead) {

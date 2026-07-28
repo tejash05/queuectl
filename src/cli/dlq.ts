@@ -14,13 +14,16 @@ export function registerDlqCommand(program: Command): void {
     .command("list")
     .description("List dead-lettered jobs")
     .option("--json", "Print only a JSON array to stdout")
-    .option("--limit <n>", "Maximum rows", "50")
-    .action((options: { json?: boolean; limit: string }) => {
-      const limit = Number(options.limit);
-      if (!Number.isInteger(limit) || limit <= 0) {
-        failure("--limit must be a positive integer");
-        process.exitCode = EXIT_USAGE;
-        return;
+    .option("--limit <n>", "Optional maximum rows (default: all dead jobs)")
+    .action((options: { json?: boolean; limit?: string }) => {
+      let limit: number | undefined;
+      if (options.limit !== undefined) {
+        limit = Number(options.limit);
+        if (!Number.isInteger(limit) || limit <= 0) {
+          failure("--limit must be a positive integer");
+          process.exitCode = EXIT_USAGE;
+          return;
+        }
       }
 
       const db = openDatabase();
