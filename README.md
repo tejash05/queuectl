@@ -131,11 +131,13 @@ Existing jobs keep their snapshotted `max_retries`. New `config set max-retries`
 
 ## Crash Recovery
 
-1. Claim sets `lease_until = now + lease-timeout-ms` (default 30s)
-2. Heartbeats extend the lease while processing
-3. `kill -9` stops heartbeats; lease expires
-4. Another worker recovers `state=processing AND lease_until < now` → `pending`
-5. Worst case with defaults: < 60 seconds
+1. Worker claims job → `state=processing`, lease written (`lease_until`)
+2. Worker crashes (`kill -9`) → no cleanup
+3. Lease expires (default `lease-timeout-ms=30000` ≈ **30s**, under 60s max)
+4. `RecoveryService` resets job to `pending` and logs `Stale Job Recovered`
+5. Another worker claims it → executes → `completed`
+
+Look for these stderr logs in a live demo: `Job Claimed` → `Stale Job Recovered` → `Job Claimed` (new worker) → `Job Completed`.
 
 ## Testing
 
